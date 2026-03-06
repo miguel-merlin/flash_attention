@@ -5,6 +5,10 @@
 
 extern "C" void computeGold(float *, const float *, const float *, unsigned int, unsigned int, unsigned int);
 
+/*
+ args:
+ ./matrixmul 
+*/
 int main(int argc, char **argv)
 {
 
