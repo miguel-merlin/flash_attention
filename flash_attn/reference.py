@@ -1,3 +1,13 @@
+"""
+Reference attention implementations for correctness testing.
+
+Both implementations expect CPU float32 tensors with shape (B, H, N, d):
+  B - batch size
+  H - number of heads
+  N - sequence length
+  d - head dimension
+"""
+
 import math
 import torch
 
@@ -38,6 +48,7 @@ def attention_reference_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
 
     return out
 
+
 def attention_reference_manual(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
     Fully manual CPU attention implementation using explicit Python loops.
@@ -67,7 +78,6 @@ def attention_reference_manual(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 
     for b in range(B):
         for h in range(H):
-            #  compute score matrix for this (b, h)
             scores = torch.empty((N, N), dtype=torch.float32)
 
             for i in range(N):
@@ -77,13 +87,10 @@ def attention_reference_manual(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
                         dot += q[b, h, i, x].item() * k[b, h, j, x].item()
                     scores[i, j] = dot * scale
 
-            # row-wise softmax
             probs = torch.empty((N, N), dtype=torch.float32)
 
             for i in range(N):
                 row = scores[i]
-
-                # numerically stable softmax
                 row_max = torch.max(row).item()
 
                 exp_sum = 0.0
@@ -93,7 +100,6 @@ def attention_reference_manual(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
                 for j in range(N):
                     probs[i, j] = math.exp(row[j].item() - row_max) / exp_sum
 
-            # output accumulation
             for i in range(N):
                 for x in range(d):
                     acc = 0.0
