@@ -32,6 +32,48 @@ __global__ void flash_attention_forward_kernel(
     (void)N; (void)d; (void)scale;
 }
 
+__global__ void matmul_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    const int M,
+    const int K,
+    const int N
+)
+{
+    __shared__ float A_tile[256];
+    __shared__ float B_tile[256];
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int i = 0; i < K; i++) {
+            sum += A[row * K + i] * B[i * N + col];
+        }
+        C[row * N + col] = sum;
+    }   
+}
+
+__global__ void softmax_reduction_kernel(
+    const float* __restrict__ S,
+    float* __restrict__ P,
+    const int M,
+    const int N
+)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int i = 0; i < N; i++) {
+            sum += expf(S[row * N + i]);
+        }
+        P[row * N + col] = sum;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backward kernel (stub)
 // TODO: Implement the recompute-based Flash Attention backward:
@@ -98,9 +140,16 @@ at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const 
     int blocks = (num_elements + threads - 1) / threads;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    flash_attention_forward_kernel<<<blocks, threads, 0, stream>>>(
-        q_ptr, k_ptr, v_ptr, result_ptr,
-        static_cast<int>(N), static_cast<int>(d), scale);
+    float* d_q_times_dk_T = at::empty({B * H, N, N}, q.options()).data_ptr<float>();
+    float* d_softmax_times_dv = at::empty({B * H, N, N}, q.options()).data_ptr<float>();
+
+    matmul_kernel<<<blocks, threads, 0, stream>>>(
+        q_ptr, k_ptr, d_q_times_dk_T,
+        static_cast<int>(B * H), static_cast<int>(N), static_cast<int>(N));
+    
+    softmax_reduction_kernel<<<blocks, threads, 0, stream>>>(
+        d_q_times_dk_T, d_softmax_times_dv,
+        static_cast<int>(B * H), static_cast<int>(N));
 
     return result_tensor;
 }
