@@ -22,10 +22,11 @@ def get_extensions():
         
     use_cuda = use_cuda and torch.cuda.is_available() and CUDA_HOME is not None
     extension = CUDAExtension if use_cuda else CppExtension
-    extra_link_args = []
+    torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+    extra_link_args = [f"-Wl,-rpath,{torch_lib_dir}"]
     extra_compile_args = {
         "cxx": [
-            "-03" if not debug_mode else "-O0",
+            "-O3" if not debug_mode else "-O0",
             "-fdiagnostics-color=always",
             "-DPy_LIMITED_API=" + ("0x03060000" if py_limited_api else "0"),
         ],
@@ -38,8 +39,8 @@ def get_extensions():
         extra_compile_args["nvcc"].extend(["-g"])
         extra_link_args.extend(['-O0', '-g'])
     
-    this_dir = os.path.dirname(os.path.curdir)
-    extensions_cuda_dir = os.path.join(this_dir, library_name, "csrc")
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    extensions_cuda_dir = os.path.join(this_dir, "flash_attn", "csrc")
     sources = list(glob.glob(os.path.join(extensions_cuda_dir, "*.cpp")))
     
     extensions_cuda_dir = os.path.join(extensions_cuda_dir, "cuda")
@@ -50,7 +51,7 @@ def get_extensions():
     
     ext_modules = [
         extension(
-            f"{library_name}._C",
+            "flash_attn._C",
             sources,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
