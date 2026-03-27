@@ -6,6 +6,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cmath>
 
+#define TILE_WIDTH 16
+
+struct Matrix {
+    float* elements;
+    int width;
+    int height;
+};
+
 namespace flash_attention {
 
 // ---------------------------------------------------------------------------
@@ -33,33 +41,40 @@ __global__ void flash_attention_forward_kernel(
 }
 
 __global__ void matmul_kernel(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float* __restrict__ C,
-    const int M,
-    const int K,
-    const int N
+    const Matrix M,
+    const Matrix N,
+    const Matrix P
 )
 {
-    __shared__ float A_tile[256];
-    __shared__ float B_tile[256];
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int i = 0; i < K; i++) {
-            sum += A[row * K + i] * B[i * N + col];
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+    int bx = blockIdx.x; int by = blockIdx.y;
+    int tx = threadIdx.x; int ty = threadIdx.y;
+    int row = by * TILE_WIDTH + ty;
+    int col = bx * TILE_WIDTH + tx;
+    float pval = 0;
+    for (unsigned int m = 0; m < (M.width + TILE_WIDTH -1)/TILE_WIDTH; ++m)
+    {
+        int mCol = m * TILE_WIDTH + tx;
+        int mRow = m * TILE_WIDTH + ty;
+        Mds[ty][tx] = (row < M.height && mCol < M.width)
+                      ? M.elements[row * M.width + mCol] : 0.0f;
+        Nds[ty][tx] = (mRow < N.height && col < N.width)
+                      ? N.elements[mRow * N.width + col] : 0.0f;
+        __syncthreads();
+        for (unsigned int k = 0; k < TILE_WIDTH; ++k)
+        {
+            pval += Mds[ty][k] * Nds[k][tx];
         }
-        C[row * N + col] = sum;
-    }   
+        __syncthreads();
+    }
+    if (row < P.height && col < P.width)
+        P.elements[row * P.width + col] = pval;
 }
 
 __global__ void softmax_reduction_kernel(
-    const float* __restrict__ S,
-    float* __restrict__ P,
-    const int M,
-    const int N
+    Matrix S,
+    Matrix P
 )
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
