@@ -8,12 +8,6 @@
 
 #define TILE_WIDTH 16
 
-struct Matrix {
-    float* elements;
-    int width;
-    int height;
-};
-
 namespace flash_attention {
 
 // ---------------------------------------------------------------------------
@@ -41,9 +35,13 @@ __global__ void flash_attention_forward_kernel(
 }
 
 __global__ void matmul_kernel(
-    const Matrix M,
-    const Matrix N,
-    const Matrix P
+    const float* __restrict__ M,
+    const float* __restrict__ N,
+    float* __restrict__ P,
+    const int M_rows,
+    const int M_cols,
+    const int N_rows,
+    const int N_cols
 )
 {
     __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
@@ -53,14 +51,14 @@ __global__ void matmul_kernel(
     int row = by * TILE_WIDTH + ty;
     int col = bx * TILE_WIDTH + tx;
     float pval = 0;
-    for (unsigned int m = 0; m < (M.width + TILE_WIDTH -1)/TILE_WIDTH; ++m)
+    for (unsigned int m = 0; m < (M_cols + TILE_WIDTH -1)/TILE_WIDTH; ++m)
     {
         int mCol = m * TILE_WIDTH + tx;
         int mRow = m * TILE_WIDTH + ty;
-        Mds[ty][tx] = (row < M.height && mCol < M.width)
-                      ? M.elements[row * M.width + mCol] : 0.0f;
-        Nds[ty][tx] = (mRow < N.height && col < N.width)
-                      ? N.elements[mRow * N.width + col] : 0.0f;
+        Mds[ty][tx] = (row < M_rows && mCol < M_cols)
+                      ? M[row * M_cols + mCol] : 0.0f;
+        Nds[ty][tx] = (mRow < N_rows && col < N_cols)
+                      ? N[mRow * N_cols + col] : 0.0f;
         __syncthreads();
         for (unsigned int k = 0; k < TILE_WIDTH; ++k)
         {
@@ -68,13 +66,15 @@ __global__ void matmul_kernel(
         }
         __syncthreads();
     }
-    if (row < P.height && col < P.width)
-        P.elements[row * P.width + col] = pval;
+    if (row < M_rows && col < N_cols)
+        P[row * N_cols + col] = pval;
 }
 
 __global__ void softmax_reduction_kernel(
-    Matrix S,
-    Matrix P
+    const float* __restrict__ S,
+    float* __restrict__ P,
+    const int M,
+    const int N
 )
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
