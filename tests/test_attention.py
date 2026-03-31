@@ -238,5 +238,46 @@ class TestBackward(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# FlashAttentionCUDA tests (skipped when extension not compiled or no CUDA)
+# ---------------------------------------------------------------------------
+
+_SKIP_CUDA = False
+_SKIP_CUDA_REASON = ""
+try:
+    from flash_attn.attention import FlashAttentionCUDA
+    _flash_cuda = FlashAttentionCUDA()
+except RuntimeError as _e:
+    _SKIP_CUDA = True
+    _SKIP_CUDA_REASON = str(_e)
+
+
+@unittest.skipIf(_SKIP_CUDA, f"FlashAttentionCUDA not available: {_SKIP_CUDA_REASON}")
+class TestFlashAttentionCUDA(unittest.TestCase):
+    def setUp(self):
+        self.flash = _flash_cuda
+        self.vanilla = VanillaAttention()
+
+    def test_output_shape(self):
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 8, 8)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                q, k, v = make_qkv(B, H, N, d, device="cuda")
+                out = self.flash(q, k, v)
+                self.assertEqual(out.shape, (B, H, N, d))
+
+    def test_matches_vanilla(self):
+        """FlashAttentionCUDA output must match VanillaAttention within tolerance."""
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 32, 32), (1, 4, 128, 64)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                # FlashAttentionCUDA wrapper automatically moves to CUDA if needed.
+                q, k, v = make_qkv(B, H, N, d, device="cpu")
+                
+                out_flash = self.flash(q, k, v).cpu()
+                out_vanilla = self.vanilla(q, k, v)
+                self.assertTrue(
+                    torch.allclose(out_flash, out_vanilla, atol=ATOL, rtol=RTOL),
+                    msg=f"Max diff: {(out_flash - out_vanilla).abs().max().item():.2e}",
+                )
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -86,6 +86,8 @@ def run_benchmarks(use_cuda: bool = False) -> None:
 
     results = []
     for (B, H, N, d) in CONFIGS:
+        if device == "cpu" and N >= 2048:
+            continue
         config_str = f"B={B} H={H} N={N} d={d}"
         q, k, v = make_qkv(B, H, N, d, device=device)
 
@@ -116,6 +118,7 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             row["FlashCUDA"] = "N/A"
 
         results.append(row)
+        print(f"Finished {config_str}")
 
     print()
     report_table(results)

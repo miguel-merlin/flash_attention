@@ -34,6 +34,9 @@ def get_extensions():
             "-O3" if not debug_mode else "-O0",
         ]
     }
+    if use_cuda:
+        extra_compile_args["cxx"].append("-DWITH_CUDA")
+
     if debug_mode:
         extra_compile_args["cxx"].extend(["-g"])
         extra_compile_args["nvcc"].extend(["-g"])

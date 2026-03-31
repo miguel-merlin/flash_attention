@@ -11,13 +11,7 @@
 namespace flash_attention {
 
 // ---------------------------------------------------------------------------
-// Forward kernel (stub)
-// TODO: Implement the real Flash Attention tiled SRAM algorithm here.
-//
-// Expected tensor layout: (B, H, N, d) row-major.
-// Kernel should tile Q, K, V into SRAM blocks of size Br x d and Bc x d,
-// compute softmax incrementally (online normalisation), accumulate into O,
-// and write back without materialising the full N×N attention matrix.
+// Forward kernel
 // ---------------------------------------------------------------------------
 __global__ void flash_attention_forward_kernel(
     const float* __restrict__ query,    // (B*H, N, d)
@@ -26,75 +20,139 @@ __global__ void flash_attention_forward_kernel(
     float* __restrict__ output,         // (B*H, N, d)
     const int N,
     const int d,
-    const float scale)
+    const float scale,
+    const int Br,
+    const int Bc)
 {
-    // TODO: implement tiled flash attention forward
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    (void)idx; (void)query; (void)key; (void)value; (void)output;
-    (void)N; (void)d; (void)scale;
-}
+    int bx = blockIdx.y; 
+    int q_block_idx = blockIdx.x;
+    
+    int tx = threadIdx.x;
+    int num_threads = blockDim.x;
 
-__global__ void matmul_kernel(
-    const float* __restrict__ M,
-    const float* __restrict__ N,
-    float* __restrict__ P,
-    const int M_rows,
-    const int M_cols,
-    const int N_rows,
-    const int N_cols
-)
-{
-    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
-    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
-    int bx = blockIdx.x; int by = blockIdx.y;
-    int tx = threadIdx.x; int ty = threadIdx.y;
-    int row = by * TILE_WIDTH + ty;
-    int col = bx * TILE_WIDTH + tx;
-    float pval = 0;
-    for (unsigned int m = 0; m < (M_cols + TILE_WIDTH -1)/TILE_WIDTH; ++m)
-    {
-        int mCol = m * TILE_WIDTH + tx;
-        int mRow = m * TILE_WIDTH + ty;
-        Mds[ty][tx] = (row < M_rows && mCol < M_cols)
-                      ? M[row * M_cols + mCol] : 0.0f;
-        Nds[ty][tx] = (mRow < N_rows && col < N_cols)
-                      ? N[mRow * N_cols + col] : 0.0f;
+    int bh_offset = bx * N * d;
+    
+    extern __shared__ float sram[];
+    float* Qi = sram;                     // Br x d
+    float* Kj = &sram[Br * d];            // Bc x d
+    float* Vj = &sram[(Br + Bc) * d];     // Bc x d
+    float* S  = &sram[(Br + Bc * 2) * d]; // Br x Bc
+    float* O_i = &sram[(Br + Bc * 2) * d + Br * Bc]; // Br x d
+    
+    float* m_i_arr = &sram[(Br + Bc * 2) * d + Br * Bc + Br * d];
+    float* l_i_arr = &m_i_arr[Br];
+    float* exp_diff_arr = &l_i_arr[Br];
+    
+    int start_q = q_block_idx * Br;
+    
+    // Load Q block
+    for (int j = tx; j < Br * d; j += num_threads) {
+        int row = j / d;
+        int col = j % d;
+        if (start_q + row < N) {
+            Qi[row * d + col] = query[bh_offset + (start_q + row) * d + col];
+        } else {
+            Qi[row * d + col] = 0.0f;
+        }
+    }
+    
+    // Initialize O_i
+    for (int j = tx; j < Br * d; j += num_threads) {
+        O_i[j] = 0.0f;
+    }
+    
+    // Initialize running max and denominator
+    for (int j = tx; j < Br; j += num_threads) {
+        m_i_arr[j] = -INFINITY;
+        l_i_arr[j] = 0.0f;
+    }
+    
+    __syncthreads();
+    
+    int Tc = (N + Bc - 1) / Bc;
+    
+    for (int c = 0; c < Tc; c++) {
+        int start_k = c * Bc;
+        
+        // Load K and V blocks
+        for (int j = tx; j < Bc * d; j += num_threads) {
+            int row = j / d;
+            int col = j % d;
+            if (start_k + row < N) {
+                Kj[row * d + col] = key[bh_offset + (start_k + row) * d + col];
+                Vj[row * d + col] = value[bh_offset + (start_k + row) * d + col];
+            } else {
+                Kj[row * d + col] = 0.0f;
+                Vj[row * d + col] = 0.0f;
+            }
+        }
         __syncthreads();
-        for (unsigned int k = 0; k < TILE_WIDTH; ++k)
-        {
-            pval += Mds[ty][k] * Nds[k][tx];
+        
+        // Compute S = Q * K^T
+        for (int j = tx; j < Br * Bc; j += num_threads) {
+            int row = j / Bc;
+            int col = j % Bc;
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++) {
+                sum += Qi[row * d + k] * Kj[col * d + k];
+            }
+            S[row * Bc + col] = sum * scale;
+        }
+        __syncthreads();
+        
+        // Compute max and exponents
+        if (tx < Br) {
+            int row = tx;
+            float m_ij = -INFINITY;
+            for (int k = 0; k < Bc; k++) {
+                if (start_k + k < N) {
+                    m_ij = max(m_ij, S[row * Bc + k]);
+                }
+            }
+            float m_i_old = m_i_arr[row];
+            float m_i_new = max(m_i_old, m_ij);
+            exp_diff_arr[row] = expf(m_i_old - m_i_new);
+            m_i_arr[row] = m_i_new;
+            
+            float l_ij = 0.0f;
+            for (int k = 0; k < Bc; k++) {
+                if (start_k + k < N) {
+                    float val = expf(S[row * Bc + k] - m_i_new);
+                    S[row * Bc + k] = val; // Store P_ij
+                    l_ij += val;
+                } else {
+                    S[row * Bc + k] = 0.0f;
+                }
+            }
+            l_i_arr[row] = exp_diff_arr[row] * l_i_arr[row] + l_ij;
+        }
+        __syncthreads();
+        
+        // Update O_i
+        for (int j = tx; j < Br * d; j += num_threads) {
+            int row = j / d;
+            int col = j % d;
+            float pv = 0.0f;
+            for (int k = 0; k < Bc; k++) {
+                pv += S[row * Bc + k] * Vj[k * d + col];
+            }
+            O_i[row * d + col] = exp_diff_arr[row] * O_i[row * d + col] + pv;
         }
         __syncthreads();
     }
-    if (row < M_rows && col < N_cols)
-        P[row * N_cols + col] = pval;
-}
-
-__global__ void softmax_reduction_kernel(
-    const float* __restrict__ S,
-    float* __restrict__ P,
-    const int M,
-    const int N
-)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int i = 0; i < N; i++) {
-            sum += expf(S[row * N + i]);
+    
+    // Write out
+    for (int j = tx; j < Br * d; j += num_threads) {
+        int row = j / d;
+        int col = j % d;
+        if (start_q + row < N) {
+            output[bh_offset + (start_q + row) * d + col] = O_i[row * d + col] / l_i_arr[row];
         }
-        P[row * N + col] = sum;
     }
 }
 
 // ---------------------------------------------------------------------------
 // Backward kernel (stub)
-// TODO: Implement the recompute-based Flash Attention backward:
-//   - Reload Q, K, V tiles from HBM
-//   - Recompute S and P on-the-fly
-//   - Accumulate dQ, dK, dV without materialising N×N matrices
 // ---------------------------------------------------------------------------
 __global__ void flash_attention_backward_kernel(
     const float* __restrict__ grad_output,  // dO  (B*H, N, d)
@@ -109,7 +167,7 @@ __global__ void flash_attention_backward_kernel(
     const int d,
     const float scale)
 {
-    // TODO: implement tiled flash attention backward
+    // Placeholder for backward
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     (void)idx;
     (void)grad_output; (void)query; (void)key; (void)value; (void)out;
@@ -122,16 +180,10 @@ __global__ void flash_attention_backward_kernel(
 // ---------------------------------------------------------------------------
 at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
 {
-    TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(),
-                "Input tensors must have the same shape");
-    TORCH_CHECK(q.dim() == 4,
-                "q, k, v must have shape (B, H, N, d)");
-    TORCH_CHECK(q.dtype() == at::kFloat,
-                "Only float32 is supported");
-    TORCH_CHECK(q.device().type() == at::DeviceType::CUDA,
-                "Tensors must be on CUDA");
-    TORCH_INTERNAL_ASSERT(q.device() == k.device() && k.device() == v.device(),
-                          "All tensors must be on the same device");
+    TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "Input tensors must have the same shape");
+    TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
+    TORCH_CHECK(q.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(q.device().type() == at::DeviceType::CUDA, "Tensors must be on CUDA");
 
     at::Tensor q_contig = q.contiguous();
     at::Tensor k_contig = k.contiguous();
@@ -145,26 +197,28 @@ at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const 
     const int64_t d = static_cast<int>(q_contig.size(3));
     const float scale = 1.0f / std::sqrt(static_cast<float>(d));
 
+    int Br = (d <= 64) ? 32 : 16;
+    int Bc = (d <= 64) ? 32 : 16;
+    
+    int shared_mem_size = (2 * Br * d + 2 * Bc * d + Br * Bc + 3 * Br) * sizeof(float);
+    
+    int num_blocks_x = (N + Br - 1) / Br;
+    int num_blocks_y = B * H;
+    
+    dim3 grid(num_blocks_x, num_blocks_y);
+    dim3 block(256);
+
     const float* q_ptr = q_contig.data_ptr<float>();
     const float* k_ptr = k_contig.data_ptr<float>();
     const float* v_ptr = v_contig.data_ptr<float>();
     float* result_ptr = result_tensor.data_ptr<float>();
 
-    int num_elements = static_cast<int>(B * H * N);
-    int threads = 256;
-    int blocks = (num_elements + threads - 1) / threads;
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    float* d_q_times_dk_T = at::empty({B * H, N, N}, q.options()).data_ptr<float>();
-    float* d_softmax_times_dv = at::empty({B * H, N, N}, q.options()).data_ptr<float>();
 
-    matmul_kernel<<<blocks, threads, 0, stream>>>(
-        q_ptr, k_ptr, d_q_times_dk_T,
-        static_cast<int>(B * H), static_cast<int>(N), static_cast<int>(N));
-    
-    softmax_reduction_kernel<<<blocks, threads, 0, stream>>>(
-        d_q_times_dk_T, d_softmax_times_dv,
-        static_cast<int>(B * H), static_cast<int>(N));
+    flash_attention_forward_kernel<<<grid, block, shared_mem_size, stream>>>(
+        q_ptr, k_ptr, v_ptr, result_ptr,
+        static_cast<int>(N), static_cast<int>(d), scale, Br, Bc
+    );
 
     return result_tensor;
 }
@@ -179,24 +233,19 @@ flash_attention_backward_cuda(
     const at::Tensor &k,
     const at::Tensor &v)
 {
-    TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(),
-                "Input tensors must have the same shape");
-    TORCH_CHECK(q.device().type() == at::DeviceType::CUDA,
-                "Tensors must be on CUDA");
+    TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "Input tensors must have the same shape");
+    TORCH_CHECK(q.device().type() == at::DeviceType::CUDA, "Tensors must be on CUDA");
 
-    at::Tensor grad_q   = at::zeros_like(q);
-    at::Tensor grad_k   = at::zeros_like(k);
-    at::Tensor grad_v   = at::zeros_like(v);
+    at::Tensor grad_q = at::zeros_like(q);
+    at::Tensor grad_k = at::zeros_like(k);
+    at::Tensor grad_v = at::zeros_like(v);
 
-    // Placeholder: backward kernel stub is called but produces zeros.
-    // Replace with real kernel once implemented.
     const int64_t B = q.size(0);
     const int64_t H = q.size(1);
     const int64_t N = static_cast<int>(q.size(2));
     const int64_t d = static_cast<int>(q.size(3));
     const float scale = 1.0f / std::sqrt(static_cast<float>(d));
 
-    // dummy forward output (zeros) — real impl would save this from forward
     at::Tensor out_dummy = at::zeros_like(q);
 
     int num_elements = static_cast<int>(B * H * N);
@@ -218,13 +267,7 @@ flash_attention_backward_cuda(
     return std::make_tuple(grad_q, grad_k, grad_v);
 }
 
-// ---------------------------------------------------------------------------
-// Op registration — CUDA dispatch key
-// ---------------------------------------------------------------------------
-TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
-{
-    m.impl("flash_attention",          flash_attention::flash_attention_cuda);
-    m.impl("flash_attention_backward", flash_attention::flash_attention_backward_cuda);
-}
-
 } // namespace flash_attention
+
+
+

@@ -18,6 +18,12 @@ import torch.nn as nn
 from torch import Tensor
 from typing import Optional
 
+try:
+    import flash_attn._C
+except ImportError:
+    pass
+
+
 
 class VanillaAttention(nn.Module):
     """

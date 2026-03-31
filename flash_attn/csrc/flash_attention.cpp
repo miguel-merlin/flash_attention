@@ -6,6 +6,13 @@
 #include <cmath>
 
 extern "C" {
+#ifdef __CUDA_ARCH__
+#elif defined(__GNUC__) && defined(__x86_64__)
+    // We can just define a weak unresolved? 
+#endif
+    // If we just declare it weak, we can call it.
+    __attribute__((weak)) int flash_attention_cuda_force_link();
+
     /*
      * Creates a dummy empty _C module that can be imported from Python.
      * The import from Python will load the .so consisting of this file
@@ -13,6 +20,10 @@ extern "C" {
      */
     PyObject* PyInit__C(void)
     {
+        if (flash_attention_cuda_force_link) {
+            flash_attention_cuda_force_link();
+        }
+        
         static struct PyModuleDef module_def =
         {
             PyModuleDef_HEAD_INIT,
@@ -139,6 +150,16 @@ namespace flash_attention
     {
         m.impl("flash_attention", flash_attention::flash_attention_cpu);
         m.impl("flash_attention_backward", flash_attention::flash_attention_backward_cpu);
+    }
+
+    extern at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+    extern std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_attention_backward_cuda(
+        const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+
+    TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
+    {
+        m.impl("flash_attention", flash_attention_cuda);
+        m.impl("flash_attention_backward", flash_attention_backward_cuda);
     }
 
 } // namespace flash_attention
