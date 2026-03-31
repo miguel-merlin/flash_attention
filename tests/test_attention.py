@@ -279,5 +279,76 @@ class TestFlashAttentionCUDA(unittest.TestCase):
                     msg=f"Max diff: {(out_flash - out_vanilla).abs().max().item():.2e}",
                 )
 
+# ---------------------------------------------------------------------------
+# Native Vanilla Attention (CPP and CUDA) Tests
+# ---------------------------------------------------------------------------
+
+_SKIP_NATIVE_CPP = False
+_SKIP_NATIVE_CPP_REASON = ""
+try:
+    from flash_attn.attention import NativeVanillaAttentionCPP
+    _native_cpp = NativeVanillaAttentionCPP()
+except RuntimeError as _e:
+    _SKIP_NATIVE_CPP = True
+    _SKIP_NATIVE_CPP_REASON = str(_e)
+
+@unittest.skipIf(_SKIP_NATIVE_CPP, f"NativeVanillaAttentionCPP not available: {_SKIP_NATIVE_CPP_REASON}")
+class TestNativeVanillaAttentionCPP(unittest.TestCase):
+    def setUp(self):
+        self.attn = _native_cpp
+        self.vanilla = VanillaAttention()
+
+    def test_output_shape(self):
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 8, 8)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                q, k, v = make_qkv(B, H, N, d, device="cpu")
+                out = self.attn(q, k, v)
+                self.assertEqual(out.shape, (B, H, N, d))
+
+    def test_matches_vanilla(self):
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 8, 8), (1, 4, 16, 8)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                q, k, v = make_qkv(B, H, N, d, device="cpu")
+                out_native = self.attn(q, k, v)
+                out_vanilla = self.vanilla(q, k, v)
+                self.assertTrue(
+                    torch.allclose(out_native, out_vanilla, atol=ATOL, rtol=RTOL),
+                    msg=f"Max diff: {(out_native - out_vanilla).abs().max().item():.2e}",
+                )
+
+_SKIP_NATIVE_CUDA = False
+_SKIP_NATIVE_CUDA_REASON = ""
+try:
+    from flash_attn.attention import NativeVanillaAttentionCUDA
+    _native_cuda = NativeVanillaAttentionCUDA()
+except RuntimeError as _e:
+    _SKIP_NATIVE_CUDA = True
+    _SKIP_NATIVE_CUDA_REASON = str(_e)
+
+@unittest.skipIf(_SKIP_NATIVE_CUDA, f"NativeVanillaAttentionCUDA not available: {_SKIP_NATIVE_CUDA_REASON}")
+class TestNativeVanillaAttentionCUDA(unittest.TestCase):
+    def setUp(self):
+        self.attn = _native_cuda
+        self.vanilla = VanillaAttention()
+
+    def test_output_shape(self):
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 8, 8)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                q, k, v = make_qkv(B, H, N, d, device="cuda")
+                out = self.attn(q, k, v)
+                self.assertEqual(out.shape, (B, H, N, d))
+
+    def test_matches_vanilla(self):
+        for B, H, N, d in [(1, 1, 4, 4), (2, 2, 32, 32), (1, 4, 128, 64)]:
+            with self.subTest(B=B, H=H, N=N, d=d):
+                q, k, v = make_qkv(B, H, N, d, device="cpu")
+                out_native = self.attn(q, k, v).cpu()
+                out_vanilla = self.vanilla(q, k, v)
+                self.assertTrue(
+                    torch.allclose(out_native, out_vanilla, atol=ATOL, rtol=RTOL),
+                    msg=f"Max diff: {(out_native - out_vanilla).abs().max().item():.2e}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

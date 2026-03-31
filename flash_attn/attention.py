@@ -215,3 +215,66 @@ class FlashAttentionCUDA(nn.Module):
             k = k.to(self.device)
             v = v.to(self.device)
         return _FlashAttentionFunction.apply(q, k, v)
+
+
+# ---------------------------------------------------------------------------
+# Native Vanilla Attention Wrappers
+# ---------------------------------------------------------------------------
+
+class _NativeVanillaAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q: Tensor, k: Tensor, v: Tensor) -> Tensor:  # type: ignore[override]
+        out = torch.ops.vanilla_attention.vanilla_attention(q, k, v)
+        ctx.save_for_backward(q, k, v, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):  # type: ignore[override]
+        q, k, v, out = ctx.saved_tensors
+        d = q.shape[-1]
+        scale = 1.0 / math.sqrt(d)
+        
+        # Softmax derivatives in python
+        S = torch.matmul(q, k.transpose(-1, -2)) * scale
+        P = torch.softmax(S, dim=-1)
+        
+        dV = torch.matmul(P.transpose(-1, -2), grad_output)
+        dP = torch.matmul(grad_output, v.transpose(-1, -2))
+        dS = P * (dP - (dP * P).sum(dim=-1, keepdim=True))
+        
+        dQ = torch.matmul(dS, k) * scale
+        dK = torch.matmul(dS.transpose(-1, -2), q) * scale
+        
+        return dQ, dK, dV
+
+class NativeVanillaAttentionCPP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        try:
+            torch.ops.vanilla_attention.vanilla_attention
+        except AttributeError:
+            raise RuntimeError("vanilla_attention C++ extension not found.")
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        if q.device.type != "cpu":
+            raise ValueError("NativeVanillaAttentionCPP expects CPU tensors.")
+        return _NativeVanillaAttentionFunction.apply(q, k, v)
+
+
+class NativeVanillaAttentionCUDA(nn.Module):
+    def __init__(self, device: Optional[torch.device] = None):
+        super().__init__()
+        if not torch.cuda.is_available():
+            raise RuntimeError("NativeVanillaAttentionCUDA requires a CUDA GPU.")
+        self.device = device or torch.device("cuda", 0)
+        try:
+            torch.ops.vanilla_attention.vanilla_attention
+        except AttributeError:
+            raise RuntimeError("vanilla_attention C++ extension not found.")
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        if q.device.type != "cuda":
+            q = q.to(self.device)
+            k = k.to(self.device)
+            v = v.to(self.device)
+        return _NativeVanillaAttentionFunction.apply(q, k, v)

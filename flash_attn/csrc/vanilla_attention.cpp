@@ -1,55 +1,12 @@
-#include <Python.h>
 #include <ATen/Operators.h>
 #include <torch/all.h>
 #include <torch/library.h>
 #include <vector>
 #include <cmath>
 
-extern "C" {
-#ifdef __CUDA_ARCH__
-#elif defined(__GNUC__) && defined(__x86_64__)
-    // We can just define a weak unresolved? 
-#endif
-    // If we just declare it weak, we can call it.
-    __attribute__((weak)) int flash_attention_cuda_force_link();
-    __attribute__((weak)) int vanilla_attention_cpp_force_link();
-    __attribute__((weak)) int vanilla_attention_cuda_force_link();
-
-    /*
-     * Creates a dummy empty _C module that can be imported from Python.
-     * The import from Python will load the .so consisting of this file
-     * in this extension, so that the TORCH_LIBRARY static inits below are run.
-     */
-    PyObject* PyInit__C(void)
-    {
-        if (flash_attention_cuda_force_link) {
-            flash_attention_cuda_force_link();
-        }
-        if (vanilla_attention_cpp_force_link) {
-            vanilla_attention_cpp_force_link();
-        }
-        if (vanilla_attention_cuda_force_link) {
-            vanilla_attention_cuda_force_link();
-        }
-        
-        static struct PyModuleDef module_def =
-        {
-            PyModuleDef_HEAD_INIT,
-            "_C",
-            NULL,
-            -1,
-            NULL
-        };
-        return PyModule_Create(&module_def);
-    }
-}
-
-namespace flash_attention
+namespace vanilla_attention
 {
-    // -----------------------------------------------------------------------
-    // Forward — CPU vanilla attention (O(N^2) reference, float32 only)
-    // -----------------------------------------------------------------------
-    at::Tensor flash_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+    at::Tensor vanilla_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
     {
         TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "q, k, v must have the same shape");
         TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
@@ -122,22 +79,17 @@ namespace flash_attention
         return output;
     }
 
-    // -----------------------------------------------------------------------
-    // TODO: Replace with real gradient kernels once the CUDA kernel is implemented.
-    // The Python-side ops.py / attention.py perform the full backward in Python for now;
-    // this stub exists so the op can be registered on the C++ side too.
-    // -----------------------------------------------------------------------
     std::tuple<at::Tensor, at::Tensor, at::Tensor>
-    flash_attention_backward_cpu(
+    vanilla_attention_backward_cpu(
         const at::Tensor &grad_output,
         const at::Tensor &q,
         const at::Tensor &k,
         const at::Tensor &v)
     {
         TORCH_CHECK(false,
-            "flash_attention_backward_cpu: C++ backward not yet implemented. "
+            "vanilla_attention_backward_cpu: C++ backward not yet implemented. "
             "Gradients are computed in Python via ops.py.");
-        // Unreachable, but keeps the compiler happy:
+        // Unreachable
         return std::make_tuple(
             at::zeros_like(q), at::zeros_like(k), at::zeros_like(v));
     }
@@ -145,29 +97,33 @@ namespace flash_attention
     // -----------------------------------------------------------------------
     // Op registration
     // -----------------------------------------------------------------------
-    TORCH_LIBRARY(flash_attention, m)
+    TORCH_LIBRARY(vanilla_attention, m)
     {
         // Forward op: (Tensor q, Tensor k, Tensor v) -> Tensor
-        m.def("flash_attention(Tensor q, Tensor k, Tensor v) -> Tensor");
+        m.def("vanilla_attention(Tensor q, Tensor k, Tensor v) -> Tensor");
 
         // Backward op: (Tensor grad, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)
-        m.def("flash_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)");
+        m.def("vanilla_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)");
     }
 
-    TORCH_LIBRARY_IMPL(flash_attention, CPU, m)
+    TORCH_LIBRARY_IMPL(vanilla_attention, CPU, m)
     {
-        m.impl("flash_attention", flash_attention::flash_attention_cpu);
-        m.impl("flash_attention_backward", flash_attention::flash_attention_backward_cpu);
+        m.impl("vanilla_attention", vanilla_attention::vanilla_attention_cpu);
+        m.impl("vanilla_attention_backward", vanilla_attention::vanilla_attention_backward_cpu);
     }
 
-    extern at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
-    extern std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_attention_backward_cuda(
+#ifdef WITH_CUDA
+    extern at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+    extern std::tuple<at::Tensor, at::Tensor, at::Tensor> vanilla_attention_backward_cuda(
         const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
 
-    TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
+    TORCH_LIBRARY_IMPL(vanilla_attention, CUDA, m)
     {
-        m.impl("flash_attention", flash_attention_cuda);
-        m.impl("flash_attention_backward", flash_attention_backward_cuda);
+        m.impl("vanilla_attention", vanilla_attention_cuda);
+        m.impl("vanilla_attention_backward", vanilla_attention_backward_cuda);
     }
+#endif
 
-} // namespace flash_attention
+} // namespace vanilla_attention
+
+int vanilla_attention_cpp_force_link() { return 0; }
