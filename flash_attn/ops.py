@@ -16,10 +16,16 @@ import math
 import torch
 from torch import Tensor
 
-__all__ = ["flash_attention_forward", "register_ops"]
+__all__ = [
+    "flash_attention_forward",
+    "register_ops",
+    "paged_attention_forward",
+    "register_paged_ops",
+]
 
 # Track whether we have already registered the fake + autograd hooks
 _OPS_REGISTERED = False
+_PAGED_OPS_REGISTERED = False
 
 
 def _backward(ctx, grad_output: Tensor):
@@ -119,3 +125,59 @@ def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
             "Compile it with: pip install -e /home2/mmerlin/flash_attention"
         )
     return op(q, k, v)
+
+
+def register_paged_ops() -> None:
+    """
+    Register the fake/meta implementation for flash_attention::paged_attention.
+
+    Call after the C++ extension is imported. CUDA/CPU dispatch is handled in C++;
+    C++ backward stubs are not implemented — use a Python autograd.Function if you
+    need gradients.
+    """
+    global _PAGED_OPS_REGISTERED
+    if _PAGED_OPS_REGISTERED:
+        return
+
+    @torch.library.register_fake("flash_attention::paged_attention")
+    def _paged_attention_fake(
+        q: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        page_table: Tensor,
+        seq_lens: Tensor,
+    ) -> Tensor:
+        torch._check(q.dim() == 3, lambda: "q must be (B, H, d)")
+        torch._check(k_cache.dim() == 4, lambda: "k_cache must be (P, page_size, H, d)")
+        torch._check(v_cache.shape == k_cache.shape, lambda: "v_cache must match k_cache")
+        torch._check(page_table.dim() == 2, lambda: "page_table must be (B, max_pages)")
+        torch._check(seq_lens.dim() == 1, lambda: "seq_lens must be (B,)")
+        torch._check(
+            q.shape[0] == page_table.shape[0] == seq_lens.shape[0],
+            lambda: "B mismatch among q, page_table, seq_lens",
+        )
+        B, H, d = q.shape
+        return torch.empty((B, H, d), dtype=q.dtype, device=q.device)
+
+    _PAGED_OPS_REGISTERED = True
+
+
+def paged_attention_forward(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    page_table: Tensor,
+    seq_lens: Tensor,
+) -> Tensor:
+    """
+    Paged attention for a single decoded token per batch: q is (B, H, d); keys/values
+    live in (P, page_size, H, d) caches addressed by ``page_table`` (B, max_pages).
+    """
+    try:
+        op = torch.ops.flash_attention.paged_attention
+    except AttributeError:
+        raise RuntimeError(
+            "flash_attention C++ extension not loaded. "
+            "Compile with: pip install -e . --no-build-isolation"
+        ) from None
+    return op(q, k_cache, v_cache, page_table, seq_lens)
