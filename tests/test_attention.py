@@ -10,6 +10,7 @@ Usage:
 Tests:
   - VanillaAttention: shape, dtype, matches reference implementation
   - FlashAttentionCPP: matches VanillaAttention (skipped if extension not built)
+  - Paged attention (CPU / CUDA): matches Python reference gather + softmax (skipped if extension / CUDA unavailable)
   - Backward: gradient check via torch.autograd.gradcheck for VanillaAttention
 """
 
@@ -34,6 +35,64 @@ RTOL = 1e-5
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def paged_attention_reference(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    page_table: Tensor,
+    seq_lens: Tensor,
+) -> Tensor:
+    """
+    Same semantics as ``flash_attention::paged_attention`` (CPU/CUDA):
+    for batch b, attend over positions t = 0 .. seq_lens[b]-1 with
+    logical_page = t // page_size, offset = t % page_size,
+    physical_page = page_table[b, logical_page].
+    """
+    if q.dim() != 3:
+        raise ValueError("q must be (B, H, d)")
+    B, H, d = q.shape
+    P, page_size, Hk, dk = k_cache.shape
+    if Hk != H or dk != d:
+        raise ValueError("k_cache head/hidden dims must match q")
+    if v_cache.shape != k_cache.shape:
+        raise ValueError("v_cache must match k_cache")
+    if page_table.dim() != 2 or page_table.size(0) != B:
+        raise ValueError("page_table must be (B, max_pages)")
+    max_pages = page_table.shape[1]
+    if seq_lens.shape != (B,):
+        raise ValueError("seq_lens must be (B,)")
+
+    device = q.device
+    dtype = q.dtype
+    out = torch.zeros(B, H, d, dtype=dtype, device=device)
+    scale = 1.0 / (d ** 0.5)
+
+    pt = page_table.to(device=device, dtype=torch.long)
+    sl = seq_lens.to(device=device)
+
+    for b in range(B):
+        seq_len = int(sl[b].item())
+        if seq_len <= 0:
+            continue
+        K = torch.zeros(H, seq_len, d, dtype=dtype, device=device)
+        V = torch.zeros(H, seq_len, d, dtype=dtype, device=device)
+        for t in range(seq_len):
+            logical_page = t // page_size
+            offset = t % page_size
+            if logical_page >= max_pages:
+                raise ValueError("seq_len implies logical_page >= max_pages")
+            pp = int(pt[b, logical_page].item())
+            K[:, t, :] = k_cache[pp, offset, :, :].to(device=device, dtype=dtype)
+            V[:, t, :] = v_cache[pp, offset, :, :].to(device=device, dtype=dtype)
+
+        qb = q[b]
+        scores = (K * qb.unsqueeze(1)).sum(dim=-1) * scale
+        probs = torch.softmax(scores, dim=-1)
+        out[b] = torch.einsum("hl,hld->hd", probs, V)
+
+    return out
+
 
 def make_qkv(B, H, N, d, *, dtype=torch.float32, device="cpu") -> tuple[Tensor, Tensor, Tensor]:
     torch.manual_seed(0)
@@ -348,6 +407,202 @@ class TestNativeVanillaAttentionCUDA(unittest.TestCase):
                     torch.allclose(out_native, out_vanilla, atol=ATOL, rtol=RTOL),
                     msg=f"Max diff: {(out_native - out_vanilla).abs().max().item():.2e}",
                 )
+
+
+# ---------------------------------------------------------------------------
+# Paged attention — matches Python reference (same indexing as CPU/CUDA kernels)
+# ---------------------------------------------------------------------------
+
+import flash_attn as _flash_attn_pkg
+
+_SKIP_PAGED = not getattr(_flash_attn_pkg, "_EXTENSION_LOADED", False)
+_SKIP_PAGED_REASON = "flash_attention extension not built (pip install -e . --no-build-isolation)"
+
+
+def _make_paged_inputs(
+    *,
+    B: int,
+    H: int,
+    d: int,
+    page_size: int,
+    num_physical_pages: int,
+    seq_lens: list[int],
+    page_table: Tensor,
+    device: str | torch.device,
+    seed: int = 42,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Build float32 q, k_cache, v_cache, page_table, seq_lens on ``device``."""
+    torch.manual_seed(seed)
+    q = torch.randn(B, H, d, dtype=torch.float32, device=device)
+    k_cache = torch.randn(num_physical_pages, page_size, H, d, dtype=torch.float32, device=device)
+    v_cache = torch.randn(num_physical_pages, page_size, H, d, dtype=torch.float32, device=device)
+    sl = torch.tensor(seq_lens, dtype=torch.long, device=device)
+    pt = page_table.to(device=device, dtype=torch.long)
+    return q, k_cache, v_cache, pt, sl
+
+
+@unittest.skipIf(_SKIP_PAGED, _SKIP_PAGED_REASON)
+class TestPagedAttentionCPU(unittest.TestCase):
+    """``paged_attention`` CPU impl vs :func:`paged_attention_reference`."""
+
+    def setUp(self):
+        from flash_attn.ops import paged_attention_forward
+
+        self.paged_forward = paged_attention_forward
+
+    def test_output_shape(self):
+        B, H, d = 2, 3, 8
+        page_size, max_pages = 4, 3
+        num_physical_pages = 5
+        seq_lens = [5, 7]
+        page_table = torch.tensor([[0, 1, 2], [1, 3, 4]], dtype=torch.long)
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cpu",
+        )
+        out = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        self.assertEqual(out.shape, (B, H, d))
+
+    def test_matches_reference_identity_pages(self):
+        """Logical page i maps to physical page i (contiguous KV)."""
+        B, H, d = 1, 2, 16
+        page_size, max_pages = 8, 4
+        seq_lens = [30]
+        num_physical_pages = max_pages
+        page_table = torch.arange(max_pages, dtype=torch.long).unsqueeze(0).expand(B, -1).clone()
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cpu",
+            seed=0,
+        )
+        out_native = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        out_ref = paged_attention_reference(q, k_cache, v_cache, pt, sl)
+        self.assertTrue(
+            torch.allclose(out_native, out_ref, atol=ATOL, rtol=RTOL),
+            msg=f"Max diff: {(out_native - out_ref).abs().max().item():.2e}",
+        )
+
+    def test_matches_reference_scattered_pages(self):
+        """Non-identity ``page_table`` stress test."""
+        B, H, d = 2, 2, 8
+        page_size, max_pages = 3, 4
+        num_physical_pages = 6
+        seq_lens = [5, 9]
+        page_table = torch.tensor([[2, 0, 1, 0], [5, 3, 1, 4]], dtype=torch.long)
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cpu",
+            seed=1,
+        )
+        out_native = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        out_ref = paged_attention_reference(q, k_cache, v_cache, pt, sl)
+        self.assertTrue(
+            torch.allclose(out_native, out_ref, atol=ATOL, rtol=RTOL),
+            msg=f"Max diff: {(out_native - out_ref).abs().max().item():.2e}",
+        )
+
+    def test_zero_seq_len_batch(self):
+        """Batch row with seq_len 0 should contribute zeros."""
+        B, H, d = 2, 1, 4
+        page_size, max_pages = 2, 2
+        num_physical_pages = 2
+        seq_lens = [0, 3]
+        page_table = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cpu",
+            seed=2,
+        )
+        out_native = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        out_ref = paged_attention_reference(q, k_cache, v_cache, pt, sl)
+        self.assertTrue(torch.allclose(out_native, out_ref, atol=ATOL, rtol=RTOL))
+        self.assertTrue(torch.all(out_native[0] == 0))
+
+
+_SKIP_PAGED_CUDA = _SKIP_PAGED or not torch.cuda.is_available()
+_SKIP_PAGED_CUDA_REASON = (
+    _SKIP_PAGED_REASON if _SKIP_PAGED else "CUDA not available"
+)
+
+
+@unittest.skipIf(_SKIP_PAGED_CUDA, _SKIP_PAGED_CUDA_REASON)
+class TestPagedAttentionCUDA(unittest.TestCase):
+    """``paged_attention`` CUDA impl vs reference on CPU (same numeric values)."""
+
+    def setUp(self):
+        from flash_attn.ops import paged_attention_forward
+
+        self.paged_forward = paged_attention_forward
+
+    def test_output_shape(self):
+        B, H, d = 2, 3, 8
+        page_size, max_pages = 4, 3
+        num_physical_pages = 5
+        seq_lens = [5, 7]
+        page_table = torch.tensor([[0, 1, 2], [1, 3, 4]], dtype=torch.long)
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cuda",
+        )
+        out = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        self.assertEqual(out.shape, (B, H, d))
+        self.assertEqual(out.device.type, "cuda")
+
+    def test_matches_reference(self):
+        B, H, d = 1, 2, 32
+        page_size, max_pages = 16, 4
+        seq_lens = [50]
+        num_physical_pages = max_pages
+        page_table = torch.tensor([[3, 2, 1, 0]], dtype=torch.long)
+        q, k_cache, v_cache, pt, sl = _make_paged_inputs(
+            B=B,
+            H=H,
+            d=d,
+            page_size=page_size,
+            num_physical_pages=num_physical_pages,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            device="cuda",
+            seed=3,
+        )
+        out_cuda = self.paged_forward(q, k_cache, v_cache, pt, sl)
+        out_ref = paged_attention_reference(
+            q.cpu(), k_cache.cpu(), v_cache.cpu(), pt.cpu(), sl.cpu()
+        )
+        self.assertTrue(
+            torch.allclose(out_cuda.cpu(), out_ref, atol=ATOL, rtol=RTOL),
+            msg=f"Max diff: {(out_cuda.cpu() - out_ref).abs().max().item():.2e}",
+        )
 
 
 if __name__ == "__main__":

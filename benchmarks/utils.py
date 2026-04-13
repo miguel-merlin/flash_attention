@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-from typing import Optional
 
 
 def make_qkv(
@@ -38,6 +37,46 @@ def make_qkv(
     k = torch.randn(shape, dtype=dtype, generator=gen).to(device)
     v = torch.randn(shape, dtype=dtype, generator=gen).to(device)
     return q, k, v
+
+
+def make_paged_attention_inputs(
+    B: int,
+    H: int,
+    N: int,
+    d: int,
+    *,
+    page_size: int = 16,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+    seed: int = 42,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """
+    Build tensors for ``flash_attention::paged_attention`` (decode over ``N`` cached tokens).
+
+    ``q`` is (B, H, d); ``k_cache`` / ``v_cache`` are (P, page_size, H, d) with identity
+    ``page_table`` so position ``t`` maps to physical page ``t // page_size``;
+    ``seq_lens[b] == N`` for all ``b``.
+
+    Returns:
+        (q, k_cache, v_cache, page_table, seq_lens)
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    max_pages = max(1, (N + page_size - 1) // page_size)
+    P = max_pages
+    q = torch.randn(B, H, d, dtype=dtype, generator=gen).to(device)
+    shape_cache = (P, page_size, H, d)
+    k_cache = torch.randn(shape_cache, dtype=dtype, generator=gen).to(device)
+    v_cache = torch.randn(shape_cache, dtype=dtype, generator=gen).to(device)
+    page_table = (
+        torch.arange(max_pages, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(B, -1)
+        .contiguous()
+        .to(device)
+    )
+    seq_lens = torch.full((B,), N, dtype=torch.long, device=device)
+    return q, k_cache, v_cache, page_table, seq_lens
 
 
 def format_bytes(n: int) -> str:

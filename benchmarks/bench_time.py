@@ -6,7 +6,9 @@ Usage:
     python3 benchmarks/bench_time.py [--cuda]
 
 Measures wall-clock latency using torch.utils.benchmark.Timer with warmup.
-Prints a side-by-side table for each (B, H, N, d) configuration.
+Prints a side-by-side table for each (B, H, N, d) configuration (full-sequence
+attention plus optional ``paged_attention`` over ``N`` cached tokens when the
+extension is built).
 """
 
 from __future__ import annotations
@@ -22,7 +24,12 @@ import torch
 import torch.utils.benchmark as benchmark
 
 from flash_attn.attention import VanillaAttention
-from benchmarks.utils import make_qkv, format_time_us, report_table
+from benchmarks.utils import (
+    make_qkv,
+    make_paged_attention_inputs,
+    format_time_us,
+    report_table,
+)
 
 # ---------------------------------------------------------------------------
 # Benchmark configurations — add / remove as needed
@@ -54,6 +61,24 @@ def bench_one(fn, label: str, q, k, v, device: str) -> float:
     return result.median  # seconds
 
 
+def bench_one_paged(paged_fn, q, kc, vc, pt, sl) -> float:
+    """Median seconds for ``paged_fn(q, kc, vc, pt, sl)`` (decode over cached length)."""
+    timer = benchmark.Timer(
+        stmt="paged_fn(q, kc, vc, pt, sl)",
+        globals={
+            "paged_fn": paged_fn,
+            "q": q,
+            "kc": kc,
+            "vc": vc,
+            "pt": pt,
+            "sl": sl,
+        },
+        num_threads=NUM_THREADS,
+        label="paged_attention",
+    )
+    return timer.timeit(BENCH_ITERS).median
+
+
 def run_benchmarks(use_cuda: bool = False) -> None:
     device = "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
     if use_cuda and not torch.cuda.is_available():
@@ -79,6 +104,18 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             print("[INFO] FlashAttentionCUDA loaded.")
         except RuntimeError as e:
             print(f"[WARNING] FlashAttentionCUDA unavailable: {e}")
+
+    paged_forward = None
+    try:
+        import flash_attn as _fa
+
+        if getattr(_fa, "_EXTENSION_LOADED", False):
+            from flash_attn.ops import paged_attention_forward
+
+            paged_forward = paged_attention_forward
+            print("[INFO] paged_attention (CPU/CUDA op) available.")
+    except Exception as e:
+        print(f"[WARNING] paged_attention unavailable: {e}")
 
     print(f"\n{'='*60}")
     print(f"Timing Benchmark  |  device={device}  |  warmup={WARMUP_ITERS}  |  iters={BENCH_ITERS}")
@@ -116,6 +153,18 @@ def run_benchmarks(use_cuda: bool = False) -> None:
                 row["FlashCUDA"] = f"ERR: {e}"
         else:
             row["FlashCUDA"] = "N/A"
+
+        if paged_forward is not None:
+            try:
+                q_p, kc, vc, pt, sl = make_paged_attention_inputs(
+                    B, H, N, d, page_size=16, device=device
+                )
+                t = bench_one_paged(paged_forward, q_p, kc, vc, pt, sl)
+                row["Paged"] = format_time_us(t)
+            except Exception as e:
+                row["Paged"] = f"ERR: {e}"
+        else:
+            row["Paged"] = "N/A"
 
         results.append(row)
         print(f"Finished {config_str}")
