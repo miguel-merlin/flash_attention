@@ -18,19 +18,26 @@ try:
 except ImportError:
     _EXTENSION_LOADED = False
 
-from .ops import flash_attention_forward, register_ops
+from .ops import (
+    flash_attention_forward,
+    paged_attention_forward,
+    register_ops,
+    register_paged_ops,
+)
 from .attention import VanillaAttention, FlashAttentionCPP, FlashAttentionCUDA
 from .reference import attention_reference_torch, attention_reference_manual
 
 # Register fake impl + autograd only when the extension is present
 if _EXTENSION_LOADED:
     register_ops()
+    register_paged_ops()
 
 __all__ = [
     "VanillaAttention",
     "FlashAttentionCPP",
     "FlashAttentionCUDA",
     "flash_attention_forward",
+    "paged_attention_forward",
     "attention_reference_torch",
     "attention_reference_manual",
 ]

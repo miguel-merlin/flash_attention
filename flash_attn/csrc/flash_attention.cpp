@@ -14,6 +14,7 @@ extern "C" {
     __attribute__((weak)) int flash_attention_cuda_force_link();
     __attribute__((weak)) int vanilla_attention_cpp_force_link();
     __attribute__((weak)) int vanilla_attention_cuda_force_link();
+    __attribute__((weak)) int paged_attention_cuda_force_link();
 
     /*
      * Creates a dummy empty _C module that can be imported from Python.
@@ -31,7 +32,10 @@ extern "C" {
         if (vanilla_attention_cuda_force_link) {
             vanilla_attention_cuda_force_link();
         }
-        
+        if (paged_attention_cuda_force_link) {
+            paged_attention_cuda_force_link();
+        }
+
         static struct PyModuleDef module_def =
         {
             PyModuleDef_HEAD_INIT,
@@ -165,6 +169,7 @@ namespace flash_attention
         m.impl("flash_attention_backward", flash_attention::flash_attention_backward_cpu);
     }
 
+#ifdef WITH_CUDA
     extern at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
     extern std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_attention_backward_cuda(
         const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
@@ -174,5 +179,6 @@ namespace flash_attention
         m.impl("flash_attention", flash_attention_cuda);
         m.impl("flash_attention_backward", flash_attention_backward_cuda);
     }
+#endif
 
 } // namespace flash_attention

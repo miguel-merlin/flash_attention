@@ -25,8 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
+from collections.abc import Callable
+
 from flash_attn.attention import VanillaAttention
-from benchmarks.utils import make_qkv, format_bytes, report_table
+from benchmarks.utils import make_qkv, make_paged_attention_inputs, format_bytes, report_table
 
 CONFIGS = [
     # (B, H,   N,   d)
@@ -42,33 +44,36 @@ CONFIGS = [
 # Memory measurement helpers
 # ---------------------------------------------------------------------------
 
-def _measure_cpu_memory(fn, q, k, v) -> int:
-    """Return peak CPU memory used by fn(q, k, v) in bytes (via tracemalloc)."""
+def _measure_cpu_memory_callable(fn_call: Callable[[], None]) -> int:
+    """Peak CPU bytes (tracemalloc) for a single no-arg call."""
     gc.collect()
     tracemalloc.start()
-    fn(q, k, v)
+    fn_call()
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     return peak
 
 
-def _measure_gpu_memory(fn, q, k, v) -> int:
-    """Return peak GPU memory allocated by fn(q, k, v) in bytes."""
+def _measure_gpu_memory_callable(fn_call: Callable[[], None]) -> int:
+    """Peak GPU allocated bytes for a single no-arg call."""
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    fn(q, k, v)
+    fn_call()
     torch.cuda.synchronize()
     return torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
 
-def measure_memory(fn, q, k, v, device: str) -> str:
+def measure_memory_callable(fn_call: Callable[[], None], device: str) -> str:
     try:
         if device == "cuda":
-            return format_bytes(_measure_gpu_memory(fn, q, k, v))
-        else:
-            return format_bytes(_measure_cpu_memory(fn, q, k, v))
+            return format_bytes(_measure_gpu_memory_callable(fn_call))
+        return format_bytes(_measure_cpu_memory_callable(fn_call))
     except Exception as e:
         return f"ERR: {e}"
+
+
+def measure_memory(fn, q, k, v, device: str) -> str:
+    return measure_memory_callable(lambda: fn(q, k, v), device)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +105,18 @@ def run_benchmarks(use_cuda: bool = False) -> None:
         except RuntimeError as e:
             print(f"[WARNING] FlashAttentionCUDA unavailable: {e}")
 
+    paged_forward = None
+    try:
+        import flash_attn as _fa
+
+        if getattr(_fa, "_EXTENSION_LOADED", False):
+            from flash_attn.ops import paged_attention_forward
+
+            paged_forward = paged_attention_forward
+            print("[INFO] paged_attention (CPU/CUDA op) available.")
+    except Exception as e:
+        print(f"[WARNING] paged_attention unavailable: {e}")
+
     print(f"\n{'='*60}")
     print(f"Memory Benchmark  |  device={device}")
     print(f"{'='*60}\n")
@@ -122,6 +139,16 @@ def run_benchmarks(use_cuda: bool = False) -> None:
         else:
             row["FlashCUDA"] = "N/A"
 
+        if paged_forward is not None:
+            q_p, kc, vc, pt, sl = make_paged_attention_inputs(
+                B, H, N, d, page_size=16, device=device
+            )
+            row["Paged"] = measure_memory_callable(
+                lambda: paged_forward(q_p, kc, vc, pt, sl), device
+            )
+        else:
+            row["Paged"] = "N/A"
+
         results.append(row)
 
     print()
@@ -132,14 +159,23 @@ def run_benchmarks(use_cuda: bool = False) -> None:
     B, H, N, d = CONFIGS[-1]
     q, k, v = make_qkv(B, H, N, d, device=device)
     elem_bytes = q.element_size()
-    qkv_bytes  = 3 * q.numel() * elem_bytes
-    attn_bytes = B * H * N * N * elem_bytes   # materialised attention matrix
+    qkv_bytes = 3 * q.numel() * elem_bytes
+    attn_bytes = B * H * N * N * elem_bytes  # materialised attention matrix
 
     print("--- Theoretical memory for largest config ---")
     print(f"  QKV tensors:         {format_bytes(qkv_bytes)}")
     print(f"  Attention matrix:    {format_bytes(attn_bytes)}")
     print(f"  Total (vanilla):     {format_bytes(qkv_bytes + attn_bytes)}")
     print(f"  Flash (no attn mat): {format_bytes(qkv_bytes)} (+ small SRAM tiles)")
+    q_p, kc, vc, _, _ = make_paged_attention_inputs(
+        B, H, N, d, page_size=16, device=device
+    )
+    paged_tensor_bytes = (
+        q_p.numel() * elem_bytes + kc.numel() * elem_bytes + vc.numel() * elem_bytes
+    )
+    print(
+        f"  Paged decode (q+KV cache, no N×N mat): {format_bytes(paged_tensor_bytes)}"
+    )
     print()
 
 
