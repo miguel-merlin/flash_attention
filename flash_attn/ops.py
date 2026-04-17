@@ -44,10 +44,16 @@ def _backward(ctx, grad_output: Tensor):
         dK = dS^T Q * scale
     """
     q, k, v = ctx.saved_tensors
+    is_causal = getattr(ctx, "is_causal", False)
     d = q.shape[-1]
     scale = 1.0 / math.sqrt(d)
 
     S = torch.matmul(q, k.transpose(-1, -2)) * scale
+    if is_causal:
+        causal_mask = torch.triu(
+            torch.ones(S.shape[-2:], dtype=torch.bool, device=S.device), diagonal=1
+        )
+        S = S.masked_fill(causal_mask, float("-inf"))
     P = torch.softmax(S, dim=-1)
 
     dV = torch.matmul(P.transpose(-1, -2), grad_output)
@@ -56,11 +62,12 @@ def _backward(ctx, grad_output: Tensor):
     dQ = torch.matmul(dS, k) * scale
     dK = torch.matmul(dS.transpose(-1, -2), q) * scale
 
-    return dQ, dK, dV
+    return dQ, dK, dV, None
 
 
 def _setup_context(ctx, inputs, outputs):
-    q, k, v = inputs
+    q, k, v = inputs[0], inputs[1], inputs[2]
+    ctx.is_causal = bool(inputs[3]) if len(inputs) > 3 else False
     saved_q = q if ctx.needs_input_grad[0] else None
     saved_k = k if ctx.needs_input_grad[1] else None
     saved_v = v if ctx.needs_input_grad[2] else None
@@ -83,13 +90,14 @@ def register_ops() -> None:
 
     # Fake / abstract implementation (for torch.compile, torch.export, etc.)
     @torch.library.register_fake("flash_attention::flash_attention")
-    def _flash_attention_fake(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def _flash_attention_fake(q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         torch._check(q.shape == k.shape == v.shape,
                      lambda: "q, k, v must have the same shape")
         torch._check(q.dtype == k.dtype == v.dtype,
                      lambda: "q, k, v must have the same dtype")
         torch._check(q.device == k.device == v.device,
                      lambda: "q, k, v must be on the same device")
+        _ = is_causal  # meta-only; matches C++ schema
         return torch.empty_like(q)
 
     # Autograd wiring
@@ -102,7 +110,9 @@ def register_ops() -> None:
     _OPS_REGISTERED = True
 
 
-def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+def flash_attention_forward(
+    q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False
+) -> Tensor:
     """
     Dispatch flash attention through the registered C++ / CUDA op.
 
@@ -110,6 +120,7 @@ def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         q: (B, H, N, d)  — same device/dtype as k and v
         k: (B, H, N, d)
         v: (B, H, N, d)
+        is_causal: if True, apply causal masking in the kernel / reference path.
 
     Returns:
         (B, H, N, d) output tensor
@@ -124,7 +135,7 @@ def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
             "flash_attention C++ extension not loaded. "
             "Compile it with: pip install -e /home2/mmerlin/flash_attention"
         )
-    return op(q, k, v)
+    return op(q, k, v, is_causal)
 
 
 def register_paged_ops() -> None:
@@ -146,6 +157,7 @@ def register_paged_ops() -> None:
         v_cache: Tensor,
         page_table: Tensor,
         seq_lens: Tensor,
+        is_causal: bool = False,
     ) -> Tensor:
         torch._check(q.dim() == 3, lambda: "q must be (B, H, d)")
         torch._check(k_cache.dim() == 4, lambda: "k_cache must be (P, page_size, H, d)")
@@ -156,6 +168,7 @@ def register_paged_ops() -> None:
             q.shape[0] == page_table.shape[0] == seq_lens.shape[0],
             lambda: "B mismatch among q, page_table, seq_lens",
         )
+        _ = is_causal
         B, H, d = q.shape
         return torch.empty((B, H, d), dtype=q.dtype, device=q.device)
 
@@ -168,10 +181,15 @@ def paged_attention_forward(
     v_cache: Tensor,
     page_table: Tensor,
     seq_lens: Tensor,
+    is_causal: bool = False,
 ) -> Tensor:
     """
     Paged attention for a single decoded token per batch: q is (B, H, d); keys/values
     live in (P, page_size, H, d) caches addressed by ``page_table`` (B, max_pages).
+
+    ``is_causal`` matches the flash_attention / vanilla_attention API; for the
+    current decode-only layout (attention over positions ``0 .. seq_len-1``) it
+    does not change numerics.
     """
     try:
         op = torch.ops.flash_attention.paged_attention
@@ -180,4 +198,4 @@ def paged_attention_forward(
             "flash_attention C++ extension not loaded. "
             "Compile with: pip install -e . --no-build-isolation"
         ) from None
-    return op(q, k_cache, v_cache, page_table, seq_lens)
+    return op(q, k_cache, v_cache, page_table, seq_lens, is_causal)

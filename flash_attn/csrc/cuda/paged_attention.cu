@@ -41,7 +41,8 @@ __global__ void paged_attention_forward_kernel_naive(
     int64_t H,
     int64_t d,
     int64_t page_size,
-    int64_t max_pages)
+    int64_t max_pages,
+    bool /* is_causal */)
 {
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t total = B * H * d;
@@ -123,7 +124,8 @@ at::Tensor paged_attention_cuda(
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor& page_table,
-    const at::Tensor& seq_lens)
+    const at::Tensor& seq_lens,
+    bool is_causal)
 {
     TORCH_CHECK(q.device().type() == at::DeviceType::CUDA, "q must be CUDA");
     TORCH_CHECK(k_cache.device().type() == at::DeviceType::CUDA, "k_cache must be CUDA");
@@ -183,7 +185,8 @@ at::Tensor paged_attention_cuda(
         pt_long.data_ptr<int64_t>(),
         sl_long.data_ptr<int64_t>(),
         out.data_ptr<float>(),
-        B, H, d, page_size, max_pages);
+        B, H, d, page_size, max_pages,
+        is_causal);
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -201,7 +204,8 @@ paged_attention_backward_cuda(
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor& /* page_table */,
-    const at::Tensor& /* seq_lens */)
+    const at::Tensor& /* seq_lens */,
+    bool /* is_causal */)
 {
     TORCH_CHECK(false, "paged_attention_backward CUDA not implemented");
     return std::make_tuple(

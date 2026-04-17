@@ -17,8 +17,12 @@ at::Tensor paged_attention_cpu(
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor& page_table,
-    const at::Tensor& seq_lens)
+    const at::Tensor& seq_lens,
+    bool /* is_causal */)
 {
+    // is_causal: reserved for API parity with flash_attention(q,k,v,is_causal).
+    // Decode-style paged attention only ever reads past KV (0 .. seq_len-1), so
+    // masking matches full causal attention over the prefix; no extra mask here.
     TORCH_CHECK(q.dim() == 3, "q must have shape (B, H, d)");
     TORCH_CHECK(k_cache.dim() == 4, "k_cache must have shape (P, page_size, H, d)");
     TORCH_CHECK(v_cache.dim() == 4, "v_cache must have shape (P, page_size, H, d)");
@@ -160,7 +164,8 @@ paged_attention_backward_cpu(
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor&,
-    const at::Tensor&)
+    const at::Tensor&,
+    bool /* is_causal */)
 {
     TORCH_CHECK(false,
                 "paged_attention_backward_cpu: C++ backward not yet implemented. "
@@ -173,10 +178,10 @@ TORCH_LIBRARY_FRAGMENT(flash_attention, m)
 {
     m.def(
         "paged_attention(Tensor q, Tensor k_cache, Tensor v_cache, Tensor page_table, Tensor "
-        "seq_lens) -> Tensor");
+        "seq_lens, bool is_causal=False) -> Tensor");
     m.def(
         "paged_attention_backward(Tensor grad_output, Tensor q, Tensor k_cache, Tensor v_cache, "
-        "Tensor page_table, Tensor seq_lens) -> (Tensor, Tensor, Tensor)");
+        "Tensor page_table, Tensor seq_lens, bool is_causal=False) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flash_attention, CPU, m)
@@ -191,7 +196,8 @@ extern at::Tensor paged_attention_cuda(
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor& page_table,
-    const at::Tensor& seq_lens);
+    const at::Tensor& seq_lens,
+    bool is_causal);
 
 extern std::tuple<at::Tensor, at::Tensor, at::Tensor> paged_attention_backward_cuda(
     const at::Tensor& grad_output,
@@ -199,7 +205,8 @@ extern std::tuple<at::Tensor, at::Tensor, at::Tensor> paged_attention_backward_c
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
     const at::Tensor& page_table,
-    const at::Tensor& seq_lens);
+    const at::Tensor& seq_lens,
+    bool is_causal);
 
 TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
 {

@@ -8,22 +8,27 @@ A custom PyTorch CUDA extension for Flash Attention — designed for experimenta
 flash_attention/
 ├── flash_attn/
 │   ├── __init__.py          # Package entry-point; lazy _C extension loading
-│   ├── attention.py         # nn.Module variants: VanillaAttention, FlashAttentionCPP, FlashAttentionCUDA
-│   ├── ops.py               # register_fake, register_autograd, flash_attention_forward()
+│   ├── attention.py         # VanillaAttention, Flash*, NativeVanilla*; optional is_causal
+│   ├── ops.py               # Fake/autograd + flash_attention_forward / paged_attention_forward
 │   ├── reference.py         # CPU reference implementations (torch ops + manual loops)
 │   └── csrc/
-│       ├── flash_attention.cpp          # TORCH_LIBRARY registration; CPU forward + backward stubs
+│       ├── flash_attention.cpp   # flash_attention + paged_attention TORCH_LIBRARY (CPU + CUDA decls)
+│       ├── vanilla_attention.cpp
+│       ├── paged_attention.cpp   # CPU paged decode attention + op registration
 │       └── cuda/
-│           └── flash_attention.cu       # CUDA forward + backward kernel stubs (TODO: implement)
+│           ├── flash_attention.cu
+│           ├── vanilla_attention.cu
+│           └── paged_attention.cu
 ├── benchmarks/
-│   ├── bench_time.py        # Latency benchmarks (torch.utils.benchmark); --cuda flag
-│   ├── bench_memory.py      # Peak memory profiling (tracemalloc / cuda.memory_stats)
-│   ├── bench_tps.py         # Tokens per second benchmark evaluating text generation limits
-│   └── utils.py             # make_qkv(), format_bytes(), report_table()
+│   ├── bench_time.py        # Latency (dense + optional paged op); --cuda
+│   ├── bench_memory.py      # Peak memory (dense + optional paged); --cuda
+│   ├── bench_tps.py         # GPT-2 text generation TPS (HF; dense flash patch on GPU)
+│   ├── bench_paged_tps.py   # paged_attention_forward throughput (synthetic KV; not LM generate)
+│   └── utils.py             # make_qkv(), make_paged_attention_inputs(), format_bytes(), report_table()
 ├── tests/
-│   └── test_attention.py    # Correctness tests + gradcheck + finite-difference backward check
-├── test_reference.py        # Quick sanity check: torch-ops ref vs manual loops
-├── llm.py                   # HF integration: monkey-patches GPT-2 to use custom causal attention
+│   ├── test_attention.py    # Correctness + paged CPU/CUDA vs reference
+│   └── test_reference.py    # Quick sanity: torch-ops ref vs manual loops
+├── llm.py                   # HF: GPT-2 generate with / without patched FlashAttentionCUDA
 ├── setup.py                 # CUDA extension build config
 ├── pyproject.toml
 └── requirements.txt
@@ -129,8 +134,12 @@ python3 benchmarks/bench_memory.py
 # Memory (GPU)
 python3 benchmarks/bench_memory.py --cuda
 
-# Tokens Per Second (TPS) Evaluation for text generation (GPU)
+# Tokens Per Second (TPS) — GPT-2 generation with optional dense flash patch (GPU)
 python3 benchmarks/bench_tps.py
+
+# Paged attention throughput — synthetic paged KV; median latency / batch rows per sec (CPU or GPU)
+python3 benchmarks/bench_paged_tps.py
+python3 benchmarks/bench_paged_tps.py --cuda --b 4 --n 512 --iters 200
 ```
 
 ## Implementing the CUDA Kernel
