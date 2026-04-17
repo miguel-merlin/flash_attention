@@ -72,6 +72,7 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             print(f"[WARNING] FlashAttentionCPP unavailable: {e}")
 
     flash_cuda = None
+    native_vanilla_cuda = None
     if device == "cuda":
         try:
             from flash_attn.attention import FlashAttentionCUDA
@@ -79,6 +80,12 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             print("[INFO] FlashAttentionCUDA loaded.")
         except RuntimeError as e:
             print(f"[WARNING] FlashAttentionCUDA unavailable: {e}")
+        try:
+            from flash_attn.attention import NativeVanillaAttentionCUDA
+            native_vanilla_cuda = NativeVanillaAttentionCUDA()
+            print("[INFO] NativeVanillaCUDA loaded.")
+        except RuntimeError as e:
+            print(f"[WARNING] NativeVanillaCUDA unavailable: {e}")
 
     print(f"\n{'='*60}")
     print(f"Timing Benchmark  |  device={device}  |  warmup={WARMUP_ITERS}  |  iters={BENCH_ITERS}")
@@ -116,6 +123,16 @@ def run_benchmarks(use_cuda: bool = False) -> None:
                 row["FlashCUDA"] = f"ERR: {e}"
         else:
             row["FlashCUDA"] = "N/A"
+            
+        # --- NativeVanillaCUDA ---
+        if native_vanilla_cuda is not None:
+            try:
+                t = bench_one(native_vanilla_cuda, "NativeVanillaCUDA", q, k, v, device)
+                row["NativeCUDA"] = format_time_us(t)
+            except Exception as e:
+                row["NativeCUDA"] = f"ERR: {e}"
+        else:
+            row["NativeCUDA"] = "N/A"
 
         results.append(row)
         print(f"Finished {config_str}")

@@ -18,10 +18,12 @@ flash_attention/
 ├── benchmarks/
 │   ├── bench_time.py        # Latency benchmarks (torch.utils.benchmark); --cuda flag
 │   ├── bench_memory.py      # Peak memory profiling (tracemalloc / cuda.memory_stats)
+│   ├── bench_tps.py         # Tokens per second benchmark evaluating text generation limits
 │   └── utils.py             # make_qkv(), format_bytes(), report_table()
 ├── tests/
 │   └── test_attention.py    # Correctness tests + gradcheck + finite-difference backward check
 ├── test_reference.py        # Quick sanity check: torch-ops ref vs manual loops
+├── llm.py                   # HF integration: monkey-patches GPT-2 to use custom causal attention
 ├── setup.py                 # CUDA extension build config
 ├── pyproject.toml
 └── requirements.txt
@@ -126,6 +128,9 @@ python3 benchmarks/bench_memory.py
 
 # Memory (GPU)
 python3 benchmarks/bench_memory.py --cuda
+
+# Tokens Per Second (TPS) Evaluation for text generation (GPU)
+python3 benchmarks/bench_tps.py
 ```
 
 ## Implementing the CUDA Kernel

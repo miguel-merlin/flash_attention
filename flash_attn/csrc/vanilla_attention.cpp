@@ -6,7 +6,7 @@
 
 namespace vanilla_attention
 {
-    at::Tensor vanilla_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+    at::Tensor vanilla_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal)
     {
         TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "q, k, v must have the same shape");
         TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
@@ -43,11 +43,15 @@ namespace vanilla_attention
                 for (int64_t i = 0; i < N; ++i) {
                     std::vector<float> scores(N, 0.0f);
                     for (int64_t j = 0; j < N; ++j) {
-                        float dot = 0.0f;
-                        for (int64_t x = 0; x < d; ++x) {
-                            dot += q_ptr[idx4(b, h, i, x)] * k_ptr[idx4(b, h, j, x)];
+                        if (is_causal && j > i) {
+                            scores[j] = -INFINITY;
+                        } else {
+                            float dot = 0.0f;
+                            for (int64_t x = 0; x < d; ++x) {
+                                dot += q_ptr[idx4(b, h, i, x)] * k_ptr[idx4(b, h, j, x)];
+                            }
+                            scores[j] = dot * scale;
                         }
-                        scores[j] = dot * scale;
                     }
 
                     float row_max = scores[0];
@@ -84,7 +88,8 @@ namespace vanilla_attention
         const at::Tensor &grad_output,
         const at::Tensor &q,
         const at::Tensor &k,
-        const at::Tensor &v)
+        const at::Tensor &v,
+        bool is_causal)
     {
         TORCH_CHECK(false,
             "vanilla_attention_backward_cpu: C++ backward not yet implemented. "
@@ -99,11 +104,11 @@ namespace vanilla_attention
     // -----------------------------------------------------------------------
     TORCH_LIBRARY(vanilla_attention, m)
     {
-        // Forward op: (Tensor q, Tensor k, Tensor v) -> Tensor
-        m.def("vanilla_attention(Tensor q, Tensor k, Tensor v) -> Tensor");
+        // Forward op: (Tensor q, Tensor k, Tensor v, bool is_causal) -> Tensor
+        m.def("vanilla_attention(Tensor q, Tensor k, Tensor v, bool is_causal=False) -> Tensor");
 
-        // Backward op: (Tensor grad, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)
-        m.def("vanilla_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)");
+        // Backward op: (Tensor grad, Tensor q, Tensor k, Tensor v, bool is_causal) -> (Tensor, Tensor, Tensor)
+        m.def("vanilla_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, bool is_causal=False) -> (Tensor, Tensor, Tensor)");
     }
 
     TORCH_LIBRARY_IMPL(vanilla_attention, CPU, m)
@@ -113,9 +118,9 @@ namespace vanilla_attention
     }
 
 #ifdef WITH_CUDA
-    extern at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+    extern at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
     extern std::tuple<at::Tensor, at::Tensor, at::Tensor> vanilla_attention_backward_cuda(
-        const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+        const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
 
     TORCH_LIBRARY_IMPL(vanilla_attention, CUDA, m)
     {

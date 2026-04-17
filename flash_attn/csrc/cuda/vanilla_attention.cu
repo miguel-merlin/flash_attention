@@ -15,7 +15,8 @@ __global__ void bmm_qk_kernel(
     float* __restrict__ S,          // (B*H, N, N)
     const int N,
     const int d,
-    const float scale)
+    const float scale,
+    const bool is_causal)
 {
     int batch_idx = blockIdx.z;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -29,7 +30,11 @@ __global__ void bmm_qk_kernel(
         for (int i = 0; i < d; ++i) {
             sum += Q[offset_q + i] * K[offset_k + i];
         }
-        S[batch_idx * N * N + row * N + col] = sum * scale;
+        if (is_causal && col > row) {
+            S[batch_idx * N * N + row * N + col] = -INFINITY;
+        } else {
+            S[batch_idx * N * N + row * N + col] = sum * scale;
+        }
     }
 }
 
@@ -89,7 +94,7 @@ __global__ void bmm_pv_kernel(
     }
 }
 
-at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal)
 {
     TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "Input tensors must have the same shape");
     TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
@@ -121,7 +126,7 @@ at::Tensor vanilla_attention_cuda(const at::Tensor &q, const at::Tensor &k, cons
     dim3 block_qk(16, 16);
     dim3 grid_qk((N + 15) / 16, (N + 15) / 16, B * H);
     bmm_qk_kernel<<<grid_qk, block_qk, 0, stream>>>(
-        q_ptr, k_ptr, S_ptr, N, d, scale
+        q_ptr, k_ptr, S_ptr, N, d, scale, is_causal
     );
 
     // 2. Softmax (Row-wise max and reduce)
@@ -146,7 +151,8 @@ vanilla_attention_backward_cuda(
     const at::Tensor &grad_output,
     const at::Tensor &q,
     const at::Tensor &k,
-    const at::Tensor &v)
+    const at::Tensor &v,
+    bool is_causal)
 {
     // Dummy return, backward is handled in Python level
     return std::make_tuple(at::zeros_like(q), at::zeros_like(k), at::zeros_like(v));

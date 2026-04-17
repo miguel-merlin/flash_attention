@@ -21,6 +21,7 @@ __global__ void flash_attention_forward_kernel(
     const int N,
     const int d,
     const float scale,
+    const bool is_causal,
     const int Br,
     const int Bc)
 {
@@ -96,7 +97,13 @@ __global__ void flash_attention_forward_kernel(
             for (int k = 0; k < d; k++) {
                 sum += Qi[row * d + k] * Kj[col * d + k];
             }
-            S[row * Bc + col] = sum * scale;
+            int global_row = start_q + row;
+            int global_col = start_k + col;
+            if (is_causal && global_col > global_row) {
+                S[row * Bc + col] = -INFINITY;
+            } else {
+                S[row * Bc + col] = sum * scale;
+            }
         }
         __syncthreads();
         
@@ -165,7 +172,8 @@ __global__ void flash_attention_backward_kernel(
     float* __restrict__ grad_value,          // dV
     const int N,
     const int d,
-    const float scale)
+    const float scale,
+    const bool is_causal)
 {
     // Placeholder for backward
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -178,7 +186,7 @@ __global__ void flash_attention_backward_kernel(
 // ---------------------------------------------------------------------------
 // C++ forward container
 // ---------------------------------------------------------------------------
-at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal)
 {
     TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "Input tensors must have the same shape");
     TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
@@ -217,7 +225,7 @@ at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const 
 
     flash_attention_forward_kernel<<<grid, block, shared_mem_size, stream>>>(
         q_ptr, k_ptr, v_ptr, result_ptr,
-        static_cast<int>(N), static_cast<int>(d), scale, Br, Bc
+        static_cast<int>(N), static_cast<int>(d), scale, is_causal, Br, Bc
     );
 
     return result_tensor;
@@ -231,7 +239,8 @@ flash_attention_backward_cuda(
     const at::Tensor &grad_output,
     const at::Tensor &q,
     const at::Tensor &k,
-    const at::Tensor &v)
+    const at::Tensor &v,
+    bool is_causal)
 {
     TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "Input tensors must have the same shape");
     TORCH_CHECK(q.device().type() == at::DeviceType::CUDA, "Tensors must be on CUDA");
@@ -262,7 +271,7 @@ flash_attention_backward_cuda(
         grad_q.data_ptr<float>(),
         grad_k.data_ptr<float>(),
         grad_v.data_ptr<float>(),
-        static_cast<int>(N), static_cast<int>(d), scale);
+        static_cast<int>(N), static_cast<int>(d), scale, is_causal);
 
     return std::make_tuple(grad_q, grad_k, grad_v);
 }

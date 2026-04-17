@@ -42,7 +42,7 @@ class VanillaAttention(nn.Module):
         super().__init__()
         self._scale = scale
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         """
         Args:
             q: Query tensor  (B, H, N, d)
@@ -62,6 +62,10 @@ class VanillaAttention(nn.Module):
 
         # (B, H, N, d) @ (B, H, d, N) -> (B, H, N, N)
         scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        
+        if is_causal:
+            causal_mask = torch.triu(torch.ones(scores.shape[-2:], dtype=torch.bool, device=scores.device), diagonal=1)
+            scores.masked_fill_(causal_mask, float('-inf'))
 
         probs = torch.softmax(scores, dim=-1)
 
@@ -80,10 +84,11 @@ class VanillaAttention(nn.Module):
 
 class _FlashAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q: Tensor, k: Tensor, v: Tensor) -> Tensor:  # type: ignore[override]
+    def forward(ctx, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:  # type: ignore[override]
         # Dispatch to the C++ / CUDA kernel registered under 'flash_attention'
-        out = torch.ops.flash_attention.flash_attention(q, k, v)
+        out = torch.ops.flash_attention.flash_attention(q, k, v, is_causal)
         ctx.save_for_backward(q, k, v, out)
+        ctx.is_causal = is_causal
         return out
 
     @staticmethod
@@ -105,11 +110,15 @@ class _FlashAttentionFunction(torch.autograd.Function):
             dK  = dS^T Q * scale             (B, H, N, d)
         """
         q, k, v, out = ctx.saved_tensors
+        is_causal = ctx.is_causal
         d = q.shape[-1]
         scale = 1.0 / math.sqrt(d)
 
         # Recompute forward intermediates (no extra memory saved in forward)
         S = torch.matmul(q, k.transpose(-1, -2)) * scale   # (B, H, N, N)
+        if is_causal:
+            causal_mask = torch.triu(torch.ones(S.shape[-2:], dtype=torch.bool, device=S.device), diagonal=1)
+            S.masked_fill_(causal_mask, float('-inf'))
         P = torch.softmax(S, dim=-1)                        # (B, H, N, N)
 
         # dV
@@ -125,7 +134,7 @@ class _FlashAttentionFunction(torch.autograd.Function):
         dQ = torch.matmul(dS, k) * scale        # (B, H, N, d)
         dK = torch.matmul(dS.transpose(-1, -2), q) * scale  # (B, H, N, d)
 
-        return dQ, dK, dV
+        return dQ, dK, dV, None
 
 
 class FlashAttentionCPP(nn.Module):
@@ -153,7 +162,7 @@ class FlashAttentionCPP(nn.Module):
                 "Compile it with: pip install -e /home2/mmerlin/flash_attention"
             )
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         """
         Args:
             q: Query tensor  (B, H, N, d) — float32, CPU
@@ -165,7 +174,7 @@ class FlashAttentionCPP(nn.Module):
         """
         if q.device.type != "cpu":
             raise ValueError("FlashAttentionCPP expects CPU tensors. Use FlashAttentionCUDA for GPU.")
-        return _FlashAttentionFunction.apply(q, k, v)
+        return _FlashAttentionFunction.apply(q, k, v, is_causal)
 
 
 class FlashAttentionCUDA(nn.Module):
@@ -200,7 +209,7 @@ class FlashAttentionCUDA(nn.Module):
                 "Compile it with: pip install -e /home2/mmerlin/flash_attention"
             )
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         """
         Args:
             q: Query tensor  (B, H, N, d) — float32, CUDA
@@ -214,7 +223,7 @@ class FlashAttentionCUDA(nn.Module):
             q = q.to(self.device)
             k = k.to(self.device)
             v = v.to(self.device)
-        return _FlashAttentionFunction.apply(q, k, v)
+        return _FlashAttentionFunction.apply(q, k, v, is_causal)
 
 
 # ---------------------------------------------------------------------------
@@ -223,19 +232,24 @@ class FlashAttentionCUDA(nn.Module):
 
 class _NativeVanillaAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q: Tensor, k: Tensor, v: Tensor) -> Tensor:  # type: ignore[override]
-        out = torch.ops.vanilla_attention.vanilla_attention(q, k, v)
+    def forward(ctx, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:  # type: ignore[override]
+        out = torch.ops.vanilla_attention.vanilla_attention(q, k, v, is_causal)
         ctx.save_for_backward(q, k, v, out)
+        ctx.is_causal = is_causal
         return out
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):  # type: ignore[override]
         q, k, v, out = ctx.saved_tensors
+        is_causal = ctx.is_causal
         d = q.shape[-1]
         scale = 1.0 / math.sqrt(d)
         
         # Softmax derivatives in python
         S = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if is_causal:
+            causal_mask = torch.triu(torch.ones(S.shape[-2:], dtype=torch.bool, device=S.device), diagonal=1)
+            S.masked_fill_(causal_mask, float('-inf'))
         P = torch.softmax(S, dim=-1)
         
         dV = torch.matmul(P.transpose(-1, -2), grad_output)
@@ -245,7 +259,7 @@ class _NativeVanillaAttentionFunction(torch.autograd.Function):
         dQ = torch.matmul(dS, k) * scale
         dK = torch.matmul(dS.transpose(-1, -2), q) * scale
         
-        return dQ, dK, dV
+        return dQ, dK, dV, None
 
 class NativeVanillaAttentionCPP(nn.Module):
     def __init__(self):
@@ -255,10 +269,10 @@ class NativeVanillaAttentionCPP(nn.Module):
         except AttributeError:
             raise RuntimeError("vanilla_attention C++ extension not found.")
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         if q.device.type != "cpu":
             raise ValueError("NativeVanillaAttentionCPP expects CPU tensors.")
-        return _NativeVanillaAttentionFunction.apply(q, k, v)
+        return _NativeVanillaAttentionFunction.apply(q, k, v, is_causal)
 
 
 class NativeVanillaAttentionCUDA(nn.Module):
@@ -272,9 +286,9 @@ class NativeVanillaAttentionCUDA(nn.Module):
         except AttributeError:
             raise RuntimeError("vanilla_attention C++ extension not found.")
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool = False) -> Tensor:
         if q.device.type != "cuda":
             q = q.to(self.device)
             k = k.to(self.device)
             v = v.to(self.device)
-        return _NativeVanillaAttentionFunction.apply(q, k, v)
+        return _NativeVanillaAttentionFunction.apply(q, k, v, is_causal)

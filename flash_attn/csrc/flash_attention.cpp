@@ -49,7 +49,7 @@ namespace flash_attention
     // -----------------------------------------------------------------------
     // Forward — CPU vanilla attention (O(N^2) reference, float32 only)
     // -----------------------------------------------------------------------
-    at::Tensor flash_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+    at::Tensor flash_attention_cpu(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal)
     {
         TORCH_CHECK(q.sizes() == k.sizes() && k.sizes() == v.sizes(), "q, k, v must have the same shape");
         TORCH_CHECK(q.dim() == 4, "q, k, v must have shape (B, H, N, d)");
@@ -86,11 +86,15 @@ namespace flash_attention
                 for (int64_t i = 0; i < N; ++i) {
                     std::vector<float> scores(N, 0.0f);
                     for (int64_t j = 0; j < N; ++j) {
-                        float dot = 0.0f;
-                        for (int64_t x = 0; x < d; ++x) {
-                            dot += q_ptr[idx4(b, h, i, x)] * k_ptr[idx4(b, h, j, x)];
+                        if (is_causal && j > i) {
+                            scores[j] = -INFINITY;
+                        } else {
+                            float dot = 0.0f;
+                            for (int64_t x = 0; x < d; ++x) {
+                                dot += q_ptr[idx4(b, h, i, x)] * k_ptr[idx4(b, h, j, x)];
+                            }
+                            scores[j] = dot * scale;
                         }
-                        scores[j] = dot * scale;
                     }
 
                     float row_max = scores[0];
@@ -132,7 +136,8 @@ namespace flash_attention
         const at::Tensor &grad_output,
         const at::Tensor &q,
         const at::Tensor &k,
-        const at::Tensor &v)
+        const at::Tensor &v,
+        bool is_causal)
     {
         TORCH_CHECK(false,
             "flash_attention_backward_cpu: C++ backward not yet implemented. "
@@ -147,11 +152,11 @@ namespace flash_attention
     // -----------------------------------------------------------------------
     TORCH_LIBRARY(flash_attention, m)
     {
-        // Forward op: (Tensor q, Tensor k, Tensor v) -> Tensor
-        m.def("flash_attention(Tensor q, Tensor k, Tensor v) -> Tensor");
+        // Forward op: (Tensor q, Tensor k, Tensor v, bool is_causal) -> Tensor
+        m.def("flash_attention(Tensor q, Tensor k, Tensor v, bool is_causal=False) -> Tensor");
 
-        // Backward op: (Tensor grad, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)
-        m.def("flash_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor, Tensor)");
+        // Backward op: (Tensor grad, Tensor q, Tensor k, Tensor v, bool is_causal) -> (Tensor, Tensor, Tensor)
+        m.def("flash_attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, bool is_causal=False) -> (Tensor, Tensor, Tensor)");
     }
 
     TORCH_LIBRARY_IMPL(flash_attention, CPU, m)
@@ -160,9 +165,9 @@ namespace flash_attention
         m.impl("flash_attention_backward", flash_attention::flash_attention_backward_cpu);
     }
 
-    extern at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+    extern at::Tensor flash_attention_cuda(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
     extern std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_attention_backward_cuda(
-        const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+        const at::Tensor &grad_output, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool is_causal);
 
     TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
     {
