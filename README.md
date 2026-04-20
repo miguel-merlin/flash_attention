@@ -20,11 +20,13 @@ flash_attention/
 │           ├── vanilla_attention.cu
 │           └── paged_attention.cu
 ├── benchmarks/
-│   ├── bench_time.py        # Latency (dense + optional paged op); --cuda
-│   ├── bench_memory.py      # Peak memory (dense + optional paged); --cuda
-│   ├── bench_tps.py         # GPT-2 text generation TPS (HF; dense flash patch on GPU)
-│   ├── bench_paged_tps.py   # paged_attention_forward throughput (synthetic KV; not LM generate)
-│   └── utils.py             # make_qkv(), make_paged_attention_inputs(), format_bytes(), report_table()
+│   ├── bench_time.py            # Latency (dense + optional paged op); --cuda
+│   ├── bench_memory.py          # Peak memory (dense + optional paged); --cuda
+│   ├── bench_tps.py             # End-to-end GPT-2 generation TPS sanity (std vs FlashAttentionCUDA patch)
+│   ├── bench_gpt2_prefill.py    # Prefill-only GPT-2 benchmark (full attention over N tokens) — FlashAttention target
+│   ├── bench_gpt2_decode.py     # Decode-only GPT-2 benchmark (contiguous KV cache baseline) — PagedAttention target
+│   ├── bench_paged_tps.py       # paged_attention_forward throughput (synthetic KV; not LM generate)
+│   └── utils.py                 # make_qkv(), make_paged_attention_inputs(), format_bytes(), report_table()
 ├── tests/
 │   ├── test_attention.py    # Correctness + paged CPU/CUDA vs reference
 │   └── test_reference.py    # Quick sanity: torch-ops ref vs manual loops
@@ -119,28 +121,57 @@ python3 -m unittest discover -s tests -v
 
 ## Running Benchmarks
 
+Benchmarks are split by *which phase of inference* they measure, because
+FlashAttention and PagedAttention target different phases:
+
+| Phase   | Bottleneck                    | Benchmark script                     | Kernel under test    |
+| ------- | ----------------------------- | ------------------------------------ | -------------------- |
+| Prefill | Full N×N attention over prompt | `benchmarks/bench_gpt2_prefill.py`   | **FlashAttention**   |
+| Decode  | Single-token attention over KV cache | `benchmarks/bench_gpt2_decode.py` | **PagedAttention** (baseline today; paged integration pending) |
+| End-to-end | Prefill + repeated decode (both mixed) | `benchmarks/bench_tps.py`      | Full HF `model.generate(...)` sanity |
+
+End-to-end TPS (`bench_tps.py`) is a sanity check only — it does not isolate
+attention-kernel effects, so small deltas there do not imply FlashAttention
+is (or isn't) working. Use the prefill and decode scripts for honest numbers.
+
 ```bash
 source .venv/bin/activate
 
-# Latency (CPU)
+# --- Low-level kernel benchmarks ------------------------------------------
+# Latency (CPU / GPU)
 python3 benchmarks/bench_time.py
-
-# Latency (GPU)
 python3 benchmarks/bench_time.py --cuda
 
-# Memory (CPU)
+# Memory (CPU / GPU)
 python3 benchmarks/bench_memory.py
-
-# Memory (GPU)
 python3 benchmarks/bench_memory.py --cuda
 
-# Tokens Per Second (TPS) — GPT-2 generation with optional dense flash patch (GPU)
-python3 benchmarks/bench_tps.py
-
-# Paged attention throughput — synthetic paged KV; median latency / batch rows per sec (CPU or GPU)
+# Paged attention throughput — synthetic paged KV; median latency (CPU or GPU)
 python3 benchmarks/bench_paged_tps.py
 python3 benchmarks/bench_paged_tps.py --cuda --b 4 --n 512 --iters 200
+
+# --- GPT-2 phase benchmarks -----------------------------------------------
+# End-to-end GPT-2 generation TPS sanity (std vs FlashAttentionCUDA patch).
+#   --print-output also prints the generated text for correctness spot-check.
+python3 benchmarks/bench_tps.py --tokens 50 --iters 5 --print-output
+
+# Prefill-only: single forward pass over the full prompt (full attention).
+#   This is where FlashAttention is expected to help.
+python3 benchmarks/bench_gpt2_prefill.py --lengths 32,64,128,256,512 --iters 20
+
+# Decode-only: one-token forward with an existing KV cache (fixed length).
+#   Baseline for comparing against the future PagedAttention decode integration.
+python3 benchmarks/bench_gpt2_decode.py --prompt-len 128 --iters 100
+python3 benchmarks/bench_gpt2_decode.py --prompt-len 512 --iters 100
+
+# Decode-only, growing cache (simulates real generation loop).
+python3 benchmarks/bench_gpt2_decode.py --prompt-len 128 --iters 50 --grow-cache
 ```
+
+CPU safety: all three GPT-2 scripts run on CPU without CUDA. `bench_tps.py`
+and `bench_gpt2_prefill.py` will skip the `FlashAttentionCUDA` patched run
+and clearly report `N/A`; `bench_gpt2_decode.py` does not use any custom
+CUDA kernel and runs the baseline on CPU directly.
 
 ## Implementing the CUDA Kernel
 
