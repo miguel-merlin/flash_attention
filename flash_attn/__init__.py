@@ -21,8 +21,10 @@ except ImportError:
 from .ops import (
     flash_attention_forward,
     paged_attention_forward,
+    paged_attention_v2_forward,
     register_ops,
     register_paged_ops,
+    register_paged_v2_ops,
 )
 from .attention import VanillaAttention, FlashAttentionCPP, FlashAttentionCUDA
 from .reference import attention_reference_torch, attention_reference_manual
@@ -31,6 +33,7 @@ from .reference import attention_reference_torch, attention_reference_manual
 if _EXTENSION_LOADED:
     register_ops()
     register_paged_ops()
+    register_paged_v2_ops()
 
 __all__ = [
     "VanillaAttention",
@@ -38,6 +41,7 @@ __all__ = [
     "FlashAttentionCUDA",
     "flash_attention_forward",
     "paged_attention_forward",
+    "paged_attention_v2_forward",
     "attention_reference_torch",
     "attention_reference_manual",
 ]

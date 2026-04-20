@@ -113,6 +113,7 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             print(f"[WARNING] NativeVanillaCUDA unavailable: {e}")
 
     paged_forward = None
+    paged_v2_forward = None
     try:
         import flash_attn as _fa
 
@@ -120,7 +121,15 @@ def run_benchmarks(use_cuda: bool = False) -> None:
             from flash_attn.ops import paged_attention_forward
 
             paged_forward = paged_attention_forward
-            print("[INFO] paged_attention (CPU/CUDA op) available.")
+            print("[INFO] paged_attention v1 (CPU/CUDA op) available.")
+
+            try:
+                from flash_attn.ops import paged_attention_v2_forward
+
+                paged_v2_forward = paged_attention_v2_forward
+                print("[INFO] paged_attention v2 (CPU/CUDA op) available.")
+            except (ImportError, AttributeError) as e:
+                print(f"[WARNING] paged_attention v2 unavailable: {e}")
     except Exception as e:
         print(f"[WARNING] paged_attention unavailable: {e}")
 
@@ -171,17 +180,31 @@ def run_benchmarks(use_cuda: bool = False) -> None:
         else:
             row["NativeCUDA"] = "N/A"
 
-        if paged_forward is not None:
-            try:
-                q_p, kc, vc, pt, sl = make_paged_attention_inputs(
-                    B, H, N, d, page_size=16, device=device
-                )
-                t = bench_one_paged(paged_forward, q_p, kc, vc, pt, sl)
-                row["Paged"] = format_time_us(t)
-            except Exception as e:
-                row["Paged"] = f"ERR: {e}"
+        if paged_forward is not None or paged_v2_forward is not None:
+            q_p, kc, vc, pt, sl = make_paged_attention_inputs(
+                B, H, N, d, page_size=16, device=device
+            )
+
+            if paged_forward is not None:
+                try:
+                    t = bench_one_paged(paged_forward, q_p, kc, vc, pt, sl)
+                    row["Paged v1"] = format_time_us(t)
+                except Exception as e:
+                    row["Paged v1"] = f"ERR: {e}"
+            else:
+                row["Paged v1"] = "N/A"
+
+            if paged_v2_forward is not None:
+                try:
+                    t = bench_one_paged(paged_v2_forward, q_p, kc, vc, pt, sl)
+                    row["Paged v2"] = format_time_us(t)
+                except Exception as e:
+                    row["Paged v2"] = f"ERR: {e}"
+            else:
+                row["Paged v2"] = "N/A"
         else:
-            row["Paged"] = "N/A"
+            row["Paged v1"] = "N/A"
+            row["Paged v2"] = "N/A"
 
         results.append(row)
         print(f"Finished {config_str}")

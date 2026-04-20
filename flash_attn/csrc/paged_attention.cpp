@@ -182,12 +182,18 @@ TORCH_LIBRARY_FRAGMENT(flash_attention, m)
     m.def(
         "paged_attention_backward(Tensor grad_output, Tensor q, Tensor k_cache, Tensor v_cache, "
         "Tensor page_table, Tensor seq_lens, bool is_causal=False) -> (Tensor, Tensor, Tensor)");
+    m.def(
+        "paged_attention_v2(Tensor q, Tensor k_cache, Tensor v_cache, Tensor page_table, Tensor "
+        "seq_lens, bool is_causal=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flash_attention, CPU, m)
 {
     m.impl("paged_attention", paged_attention_cpu);
     m.impl("paged_attention_backward", paged_attention_backward_cpu);
+    // v2 has no dedicated CPU kernel; reuse the reference implementation so
+    // CPU tests can cross-check CUDA v2 output against a trusted baseline.
+    m.impl("paged_attention_v2", paged_attention_cpu);
 }
 
 #ifdef WITH_CUDA
@@ -208,10 +214,19 @@ extern std::tuple<at::Tensor, at::Tensor, at::Tensor> paged_attention_backward_c
     const at::Tensor& seq_lens,
     bool is_causal);
 
+extern at::Tensor paged_attention_cuda_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& seq_lens,
+    bool is_causal);
+
 TORCH_LIBRARY_IMPL(flash_attention, CUDA, m)
 {
     m.impl("paged_attention", paged_attention_cuda);
     m.impl("paged_attention_backward", paged_attention_backward_cuda);
+    m.impl("paged_attention_v2", paged_attention_cuda_v2);
 }
 #endif
 

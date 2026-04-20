@@ -21,11 +21,14 @@ __all__ = [
     "register_ops",
     "paged_attention_forward",
     "register_paged_ops",
+    "paged_attention_v2_forward",
+    "register_paged_v2_ops",
 ]
 
 # Track whether we have already registered the fake + autograd hooks
 _OPS_REGISTERED = False
 _PAGED_OPS_REGISTERED = False
+_PAGED_V2_OPS_REGISTERED = False
 
 
 def _backward(ctx, grad_output: Tensor):
@@ -193,6 +196,69 @@ def paged_attention_forward(
     """
     try:
         op = torch.ops.flash_attention.paged_attention
+    except AttributeError:
+        raise RuntimeError(
+            "flash_attention C++ extension not loaded. "
+            "Compile with: pip install -e . --no-build-isolation"
+        ) from None
+    return op(q, k_cache, v_cache, page_table, seq_lens, is_causal)
+
+
+def register_paged_v2_ops() -> None:
+    """
+    Register the fake/meta implementation for flash_attention::paged_attention_v2.
+
+    Shape contract is identical to paged_attention (v1); only the CUDA kernel
+    differs. CPU dispatch is wired to the same reference kernel in C++.
+    """
+    global _PAGED_V2_OPS_REGISTERED
+    if _PAGED_V2_OPS_REGISTERED:
+        return
+
+    @torch.library.register_fake("flash_attention::paged_attention_v2")
+    def _paged_attention_v2_fake(
+        q: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        page_table: Tensor,
+        seq_lens: Tensor,
+        is_causal: bool = False,
+    ) -> Tensor:
+        torch._check(q.dim() == 3, lambda: "q must be (B, H, d)")
+        torch._check(k_cache.dim() == 4, lambda: "k_cache must be (P, page_size, H, d)")
+        torch._check(v_cache.shape == k_cache.shape, lambda: "v_cache must match k_cache")
+        torch._check(page_table.dim() == 2, lambda: "page_table must be (B, max_pages)")
+        torch._check(seq_lens.dim() == 1, lambda: "seq_lens must be (B,)")
+        torch._check(
+            q.shape[0] == page_table.shape[0] == seq_lens.shape[0],
+            lambda: "B mismatch among q, page_table, seq_lens",
+        )
+        _ = is_causal
+        B, H, d = q.shape
+        return torch.empty((B, H, d), dtype=q.dtype, device=q.device)
+
+    _PAGED_V2_OPS_REGISTERED = True
+
+
+def paged_attention_v2_forward(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    page_table: Tensor,
+    seq_lens: Tensor,
+    is_causal: bool = False,
+) -> Tensor:
+    """
+    Paged attention (v2 CUDA kernel). Same API as ``paged_attention_forward``:
+    ``q`` is (B, H, d); KV caches are (P, page_size, H, d) addressed by
+    ``page_table`` (B, max_pages).
+
+    On CUDA this dispatches to the v2 kernel (one block per (b, h); scores
+    computed once and reused across output dims). On CPU it falls back to the
+    reference implementation, which is useful for numerical cross-checks.
+    """
+    try:
+        op = torch.ops.flash_attention.paged_attention_v2
     except AttributeError:
         raise RuntimeError(
             "flash_attention C++ extension not loaded. "
