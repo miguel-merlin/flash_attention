@@ -2,126 +2,281 @@
 \usetheme{Madrid}
 \usecolortheme{default}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, decorations.pathreplacing, fit, backgrounds}
 
 \title{Optimizing Attention Mechanisms}
 \subtitle{Flash Attention and Paged Attention}
-\author{Parallel Programming}
+\author{CS677: Parallel Programming}
 \date{\today}
 
 \begin{document}
 
 \frame{\titlepage}
 
+% ===== SLIDE 1: Problem Statement =====
 \begin{frame}{Problem: Attention Computation}
     \begin{itemize}
-        \item Attention is the core of Transformer models: $O = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V$.
-        \item It is memory bandwidth bound, not compute-bound.
-        \item The attention matrix $S = QK^T$ has a size of $O(N^2)$, where $N$ is the sequence length.
-        \item Moving $O(N^2)$ intermediate data back and forth from \textbf{Global Memory (HBM)} causes a severe performance bottleneck.
+        \item Attention is the core of Transformer models: $O = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right)V$.
+        \item It is \textbf{memory bandwidth-bound}, not compute-bound.
+        \item The attention matrix $S = QK^T$ has size $O(N^2)$, where $N$ is the sequence length.
+        \item Moving $O(N^2)$ intermediate data to/from \textbf{Global Memory (HBM)} causes a severe bottleneck.
     \end{itemize}
 \end{frame}
 
-\begin{frame}{Naive Attention: The Bottleneck}
+% ===== SLIDE 2: Naive Attention with clear 3-kernel pipeline =====
+\begin{frame}{Naive Attention: The Three-Kernel Pipeline}
     \begin{center}
     \begin{tikzpicture}[
-        node distance=1.2cm, 
-        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.5cm, minimum height=0.6cm, align=center},
-        hbm/.style={draw, rectangle, dashed, fill=red!5, minimum width=7.5cm, minimum height=1.3cm, align=center},
-        op/.style={draw, circle, fill=orange!20, minimum size=0.8cm, align=center, inner sep=0pt},
-        arrow/.style={-{Stealth}, thick}
+        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.2cm, minimum height=0.55cm, align=center, font=\scriptsize},
+        big/.style={draw, rectangle, fill=red!15, minimum width=1.5cm, minimum height=0.55cm, align=center, font=\scriptsize},
+        op/.style={draw, rounded corners=3pt, fill=orange!20, minimum width=1.4cm, minimum height=0.55cm, align=center, font=\scriptsize},
+        hbmbox/.style={draw, dashed, rounded corners, fill=red!3, inner sep=6pt},
+        arrow/.style={-{Stealth[length=5pt]}, thick},
+        iolabel/.style={font=\tiny, color=red!70!black}
     ]
-        % HBM region
-        \node[hbm] (hbm1) at (0, 2) {};
-        \node[font=\footnotesize\bfseries, color=red!70!black] at (0, 2.4) {Global Memory (HBM)};
-        
-        % Tensors in HBM
-        \node[tensor] (Q) at (-3, 1.8) {$Q, K$};
-        \node[tensor, fill=red!20] (S) at (0, 1.8) {$S \in \mathbb{R}^{N \times N}$};
-        \node[tensor, fill=red!20] (P) at (3, 1.8) {$P \in \mathbb{R}^{N \times N}$};
-        \node[tensor] (V) at (4.5, 1.8) {$V$};
-        
-        % SRAM/Compute region
-        \node[font=\footnotesize\bfseries, color=blue!70!black] (sram) at (0, -1) {Compute / SRAM};
-        
-        % Ops
-        \node[op] (matmul1) at (-1.5, 0) {$\times$};
-        \node[op] (softmax) at (1.5, 0) {sftmx};
-        \node[op] (matmul2) at (4.5, 0) {$\times$};
-        \node[tensor] (O) at (6.5, 0) {$O$};
-        
-        % Arrows
-        \draw[arrow] (Q) |- (matmul1) node[pos=0.75, left, font=\tiny] {$O(N)$};
-        \draw[arrow] (matmul1) -- (S) node[midway, left, font=\tiny] {Write $O(N^2)$};
-        \draw[arrow] (S) -- (softmax) node[midway, left, font=\tiny] {Read $O(N^2)$};
-        \draw[arrow] (softmax) -- (P) node[midway, right, font=\tiny] {Write $O(N^2)$};
-        \draw[arrow] (P) -- (matmul2) node[midway, left, font=\tiny] {Read $O(N^2)$};
-        \draw[arrow] (V) -- (matmul2) node[midway, right, font=\tiny] {Read $O(N)$};
-        \draw[arrow] (matmul2) -- (O);
-        
-    \end{tikzpicture}
-    \end{center}
-    
-    \vspace{0.2cm}
-    \small
-    \textbf{Problem:} $S = QK^T$ and $P = \text{softmax}(S)$ are fully materialized. The $O(N^2)$ HBM read/write traffic is the bottleneck, entirely overshadowing actual computation.
-\end{frame}
+        % --- HBM region label ---
+        \node[font=\footnotesize\bfseries, color=red!70!black] at (0.5, 3.3) {Global Memory (HBM)};
 
-\begin{frame}{Flash Attention: Hardware-Aware Fusion}
-    \begin{center}
-    \begin{tikzpicture}[
-        node distance=0.8cm,
-        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.1cm, minimum height=0.5cm, font=\scriptsize},
-        sram/.style={draw, rectangle, rounded corners, fill=green!10, minimum width=5.5cm, minimum height=3.5cm},
-        op/.style={draw, circle, fill=orange!20, minimum size=0.5cm, inner sep=0pt, font=\scriptsize},
-        arrow/.style={-{Stealth}, thick}
-    ]
-        % Global Memory vectors
-        \node[font=\footnotesize\bfseries, color=red!70!black] (hbm_lbl) at (-1, 2.5) {HBM};
-        \node[tensor] (Qi) at (-1, 1.8) {$Q_{i}$};
-        \node[tensor] (Kj) at (1, 2.5) {$K_{j}$};
-        \node[tensor] (Vj) at (2.5, 2.5) {$V_{j}$};
-        \node[tensor] (Oi) at (-1, -2.5) {$O_{i}$};
-        
-        % SRAM Box
-        \node[sram] (sram_box) at (2.5, 0) {};
-        \node[font=\footnotesize\bfseries, color=green!50!black] at (2.5, 1.4) {Shared Memory (SRAM)};
-        
-        % Internal SRAM ops
-        \node[tensor] (Qi_sram) at (0.5, 0) {$Q_i$};
-        \node[tensor] (Kj_sram) at (0.5, 0.8) {$K_j$};
-        \node[tensor] (Vj_sram) at (4.5, 0.8) {$V_j$};
-        
-        \node[op] (mm1) at (2, 0.4) {$\times$};
-        \node[tensor, fill=red!20] (Sij) at (3.2, 0.4) {$S_{i,j}$};
-        \node[op] (sft) at (3.2, -0.6) {inc $\sigma$};
-        \node[tensor, fill=red!20] (Pij) at (4.5, -0.6) {$P_{i,j}$};
-        \node[op] (mm2) at (4.5, -1.4) {$\times$};
-        \node[tensor] (Oi_acc) at (2.5, -1.4) {$O_i$ acc.};
-        
-        % Connections
-        \draw[arrow, dashed] (Qi) -- (Qi_sram);
-        \draw[arrow, dashed] (Kj) -- (Kj_sram);
-        \draw[arrow, dashed] (Vj) -- (Vj_sram);
-        
-        \draw[arrow] (Qi_sram) -- (mm1);
-        \draw[arrow] (Kj_sram) -- (mm1);
-        \draw[arrow] (mm1) -- (Sij);
-        \draw[arrow] (Sij) -- (sft) node[midway, right, font=\tiny] {Registers};
-        \draw[arrow] (sft) -- (Pij);
-        \draw[arrow] (Pij) -- (mm2);
-        \draw[arrow] (Vj_sram) -- (mm2);
-        \draw[arrow] (mm2) -- (Oi_acc);
-        \draw[arrow, dashed] (Oi_acc) -| (Oi);
-        
+        % --- Row 1: Inputs in HBM ---
+        \node[tensor] (Q) at (-3.8, 2.6) {$Q$\,\tiny$(N{\times}d)$};
+        \node[tensor] (K) at (-2.0, 2.6) {$K$\,\tiny$(N{\times}d)$};
+        \node[tensor] (V) at (4.0, 2.6) {$V$\,\tiny$(N{\times}d)$};
+
+        % --- Intermediate materialized matrices ---
+        \node[big] (S) at (-0.2, 1.8) {$S$\,\tiny$(N{\times}N)$};
+        \node[big] (P) at (2.2, 1.8) {$P$\,\tiny$(N{\times}N)$};
+
+        % --- Output ---
+        \node[tensor] (O) at (5.8, -0.3) {$O$\,\tiny$(N{\times}d)$};
+
+        % --- Three separate GPU kernels ---
+        \node[op] (k1) at (-2.4, -0.3) {\textbf{Kernel 1}\\$S{=}QK^T/\!\sqrt{d}$};
+        \node[op] (k2) at (0.8, -0.3) {\textbf{Kernel 2}\\$P{=}\text{softmax}(S)$};
+        \node[op] (k3) at (3.8, -0.3) {\textbf{Kernel 3}\\$O{=}PV$};
+
+        \node[font=\scriptsize\bfseries, color=blue!70!black] at (0.5, -1.2) {GPU Compute (SM Registers)};
+
+        % --- Data flow arrows ---
+        % Kernel 1: read Q,K from HBM, write S to HBM
+        \draw[arrow] (Q.south) -- (k1.north west) node[pos=0.4, left, iolabel] {read};
+        \draw[arrow] (K.south) -- (k1.north) node[pos=0.4, right, iolabel] {read};
+        \draw[arrow, color=red!60!black] (k1.north east) -- (S.south west) node[pos=0.6, left, iolabel] {write $N^2$};
+
+        % Kernel 2: read S from HBM, write P to HBM
+        \draw[arrow, color=red!60!black] (S.south) -- (k2.north) node[pos=0.4, left, iolabel] {read $N^2$};
+        \draw[arrow, color=red!60!black] (k2.north east) -- (P.south west) node[pos=0.6, right, iolabel] {write $N^2$};
+
+        % Kernel 3: read P,V from HBM, write O to HBM
+        \draw[arrow, color=red!60!black] (P.south) -- (k3.north) node[pos=0.4, right, iolabel] {read $N^2$};
+        \draw[arrow] (V.south) -- (k3.north east) node[pos=0.4, right, iolabel] {read};
+        \draw[arrow] (k3.east) -- (O.west);
+
+        % --- Brace showing total HBM traffic ---
+        \draw[decorate, decoration={brace, amplitude=5pt}, thick, red!60!black]
+            (-1.0, 2.15) -- (3.0, 2.15) node[midway, above=6pt, font=\tiny, color=red!70!black, align=center] {Fully materialized\\in HBM};
+
     \end{tikzpicture}
     \end{center}
-    
+
     \vspace{0.1cm}
-    \footnotesize
-    \textbf{Kernel Fusion \& Tiling:} Matrices load in blocks (tiles) into fast \textbf{SRAM}. Attention and \textit{online} softmax happen on-chip. The $O(N^2)$ matrix $S$ is never materialized to HBM, resulting in $O(N)$ memory bounds.
+    \small
+    \textbf{Bottleneck:} Three separate kernel launches. $S$ and $P$ (each $N{\times}N$) are fully written to and read from slow HBM between every step, totaling $\mathbf{4N^2}$ HBM transfers.
 \end{frame}
 
+% ===== SLIDE 3: Flash Attention -- Tiling Overview =====
+\begin{frame}{Flash Attention: Tiling Strategy}
+    \begin{center}
+    \begin{tikzpicture}[
+        cell/.style={draw, minimum width=0.55cm, minimum height=0.55cm, font=\tiny},
+        highlight/.style={fill=green!25},
+        khighlight/.style={fill=blue!20},
+        arrow/.style={-{Stealth[length=5pt]}, thick}
+    ]
+        % --- Q matrix ---
+        % Label centered above the matrix
+        \node[font=\scriptsize\bfseries] at (-3.675, 2.7) {$Q$ $(N{\times}d)$};
+        \foreach \r in {0,...,5} {
+            \foreach \c in {0,...,2} {
+                \node[cell] at (-4.5+\c*0.55, 2-\r*0.55) {};
+            }
+        }
+        % Highlight Q_i block (rows 2-3)
+        \foreach \c in {0,...,2} {
+            \node[cell, highlight] at (-4.5+\c*0.55, 2-2*0.55) {};
+            \node[cell, highlight] at (-4.5+\c*0.55, 2-3*0.55) {};
+        }
+        % Brace on left side pointing inward (mirror = opens right toward matrix)
+        \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, green!50!black]
+            (-4.85, 2-1.75*0.55) -- (-4.85, 2-3.25*0.55) node[midway, left=5pt, font=\scriptsize\bfseries, color=green!50!black] {$Q_i$};
+        \node[font=\scriptsize, color=green!50!black, anchor=west] at (-3, 2-2.5*0.55) {$B_r$ rows};
+
+        % --- K^T matrix ---
+        % Label centered above the matrix
+        \node[font=\scriptsize\bfseries] at (0.375, 2.7) {$K^TV$ $(d{\times}N)$};
+        \foreach \r in {0,...,2} {
+            \foreach \c in {0,...,5} {
+                \node[cell] at (-1+\c*0.55, 2-\r*0.55) {};
+            }
+        }
+        % Highlight K_j block (cols 0-1)
+        \foreach \r in {0,...,2} {
+            \node[cell, khighlight] at (-1+0*0.55, 2-\r*0.55) {};
+            \node[cell, khighlight] at (-1+1*0.55, 2-\r*0.55) {};
+        }
+        % Brace on top pointing inward (no mirror = opens downward toward matrix)
+        \draw[decorate, decoration={brace, amplitude=4pt}, thick, blue!60!black]
+            (-1-0.05, 2+0.35) -- (-1+1*0.55+0.05, 2+0.35) node[midway, above=5pt, font=\scriptsize\bfseries, color=blue!60!black] {$K_j^T$};
+        \node[font=\scriptsize, color=blue!60!black] at (-0.725, 0.35) {$B_c$ cols};
+
+        % --- Result S_ij (small block, never in HBM) ---
+        \node[font=\scriptsize\bfseries] at (3.8, 2.5) {$S_{ij}$ \tiny(SRAM only)};
+        \node[cell, fill=orange!25] (s00) at (3.3, 1.45) {};
+        \node[cell, fill=orange!25] (s01) at (3.85, 1.45) {};
+        \node[cell, fill=orange!25] (s10) at (3.3, 0.9) {};
+        \node[cell, fill=orange!25] (s11) at (3.85, 0.9) {};
+        \node[font=\tiny] at (3.58, 0.5) {$B_r{\times}B_c$};
+
+        % Arrow from Q_i x K_j -> S_ij
+        \draw[arrow, dashed, gray] (-2.85, 0.9) -- (s00.west) node[midway, above, font=\tiny] {$\times$};
+
+        % --- Iteration arrows ---
+        \draw[arrow, blue!60!black, very thick] (-1+2*0.55+0.15, 2.15) -- (-1+3*0.55+0.4, 2.15) node[right, font=\tiny, color=blue!60!black] {sweep $j$};
+        \draw[arrow, green!50!black, very thick] (-5.1, 2-3.25*0.55-0.15) -- (-5.1, 2-4.25*0.55-0.4) node[below, font=\tiny, color=green!50!black] {next $i$};
+
+        % --- Legend ---
+        \node[font=\scriptsize, align=left] at (0.5, -1.6) {
+            Each CUDA block processes one $Q_i$ block ($B_r$ rows).\\
+            It sweeps through \emph{all} $K_j, V_j$ blocks ($j = 0 \ldots T_c{-}1$).\\
+            $S_{ij}$ stays in SRAM, \textbf{never written to HBM}.
+        };
+
+    \end{tikzpicture}
+    \end{center}
+\end{frame}
+
+% ===== SLIDE 4: Flash Attention -- Online Softmax =====
+\begin{frame}{Flash Attention: Online Softmax Trick}
+    \small
+    \textbf{Problem:} Softmax needs the global max over all $N$ keys, but we only see $B_c$ at a time.
+
+    \vspace{0.1cm}
+    \begin{center}
+    \begin{tikzpicture}[scale=0.92, every node/.style={transform shape},
+        kblock/.style={draw, rounded corners, fill=blue!10, minimum width=1.4cm, minimum height=0.7cm, align=center, font=\scriptsize},
+        state/.style={draw, rounded corners, fill=yellow!15, minimum width=1.6cm, minimum height=0.55cm, align=center, font=\scriptsize},
+        arrow/.style={-{Stealth[length=4pt]}, semithick},
+        note/.style={font=\tiny, color=gray!70!black, align=center}
+    ]
+        % Running state register (top)
+        \node[state] (s0) at (0, 1.5) {$m,\;\ell,\;\tilde{O}$};
+        \node[note, above=1pt] at (s0.north) {Running state (SRAM)};
+
+        % K/V blocks (bottom row)
+        \node[kblock] (k0) at (-3.5, 0) {$K_0, V_0$};
+        \node[kblock] (k1) at (-1.2, 0) {$K_1, V_1$};
+        \node[kblock] (k2) at (1.1, 0) {$K_2, V_2$};
+        \node[note]        at (2.8, 0) {$\cdots$};
+        \node[kblock] (kT) at (4.2, 0) {$K_{T_c}, V_{T_c}$};
+
+        % Arrows from each block up to the state
+        \foreach \kb in {k0, k1, k2, kT} {
+            \draw[arrow, blue!50!black] (\kb.north) -- (s0.south -| \kb.north) -- (s0.south);
+        }
+
+        % Update steps as annotations below blocks
+        \node[note] at (-3.5, -0.65) {Init $m, \ell, \tilde{O}$};
+        \node[note] at (-1.2, -0.65) {Rescale \&\\accumulate};
+        \node[note] at (1.1, -0.65) {Rescale \&\\accumulate};
+        \node[note] at (4.2, -0.65) {$O_i = \tilde{O}/\ell$};
+
+        % Output
+        \node[draw, fill=green!15, rounded corners, font=\scriptsize] (out) at (6.2, -1.5) {Write $O_i$ to HBM};
+        \draw[arrow, green!50!black] (s0.east) -| (out.north);
+
+    \end{tikzpicture}
+    \end{center}
+
+    \vspace{-0.05cm}
+    \footnotesize
+    Three values maintained per row in SRAM: \;$m$ (running max), \;$\ell$ (softmax denominator), \;$\tilde{O}$ (output accumulator).
+
+    \vspace{0.1cm}
+    On each new block: if a larger score appears, rescale prior work by $e^{m_{\text{old}} - m_{\text{new}}}$, then accumulate. Final: $O_i = \tilde{O} / \ell$.
+\end{frame}
+
+% ===== SLIDE 5: Flash Attention -- Full Data Flow =====
+\begin{frame}{Flash Attention: Fused Single-Kernel Data Flow}
+    \begin{center}
+    \begin{tikzpicture}[
+        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.1cm, minimum height=0.5cm, font=\scriptsize},
+        op/.style={draw, rounded corners=2pt, fill=orange!15, minimum height=0.4cm, align=center, font=\tiny, inner sep=3pt},
+        acc/.style={draw, rounded corners=2pt, fill=yellow!20, minimum height=0.4cm, align=center, font=\tiny, inner sep=3pt},
+        arrow/.style={-{Stealth[length=4pt]}, semithick},
+        dasharrow/.style={-{Stealth[length=4pt]}, semithick, dashed, color=gray!70}
+    ]
+        % --- HBM region (left column) ---
+        \node[font=\footnotesize\bfseries, color=red!70!black] at (-3.8, 3.4) {HBM};
+        \node[tensor] (Vj_hbm) at (-3.8, 2.7) {$V_j$};
+        \node[tensor] (Qi_hbm) at (-3.8, 1.7) {$Q_i$};
+        \node[tensor] (Kj_hbm) at (-3.8, 0.7) {$K_j$};
+        \node[tensor] (Oi_hbm) at (-3.8, -2.2) {$O_i$};
+
+        % --- SRAM box ---
+        \node[draw, rounded corners, fill=green!6, minimum width=9.0cm, minimum height=5.4cm] (sram) at (2.5, 0.2) {};
+        \node[font=\footnotesize\bfseries, color=green!50!black] at (2.5, 2.7) {Shared Memory (SRAM)};
+
+        % --- SRAM contents: inputs (V_j on top, then Q_i, K_j) ---
+        \node[tensor] (Vj_s) at (5.2, 2.0) {$V_j$};
+        \node[tensor] (Qi_s) at (-0.5, 2.0) {$Q_i$};
+        \node[tensor] (Kj_s) at (-0.5, 1.1) {$K_j$};
+
+        % --- Compute pipeline ---
+        \node[op] (matmul) at (1.8, 1.4) {$Q_i K_j^T / \sqrt{d}$};
+        \node[op, fill=red!12] (sij) at (3.5, 1.4) {$S_{ij}$};
+        \node[op] (osm) at (3.5, 0.2) {Online Softmax};
+        \node[op, fill=red!12] (pij) at (5.2, 0.2) {$P_{ij}$};
+        \node[op] (mm2) at (5.2, -1.0) {$P_{ij} V_j$};
+
+        % --- Accumulators ---
+        \node[acc] (acc) at (2.5, -1.0) {$\tilde{O}_i$ accumulator};
+        \node[acc] (stats) at (-0.5, -1.0) {$m_i, \ell_i$};
+
+        % --- HBM -> SRAM load arrows ---
+        \draw[dasharrow] (Qi_hbm.east) -- (Qi_s.west) node[midway, above, font=\tiny, color=gray] {load once};
+        \draw[dasharrow] (Kj_hbm.east) -- (Kj_s.west);
+        \draw[dasharrow] (Vj_hbm.east) -- (Vj_s.west);
+
+        % --- Internal compute arrows ---
+        \draw[arrow] (Qi_s.east) -- (matmul.west);
+        \draw[arrow] (Kj_s.east) -- (matmul.south west);
+        \draw[arrow] (matmul.east) -- (sij.west);
+        \draw[arrow] (sij.south) -- (osm.north);
+        \draw[arrow] (osm.east) -- (pij.west);
+        \draw[arrow] (pij.south) -- (mm2.north);
+        \draw[arrow] (Vj_s.east) -- ++(0.5, 0) |- (mm2.east);
+        \draw[arrow] (mm2.west) -- (acc.east);
+
+        % --- Online softmax state loop ---
+        \draw[arrow] (osm.south west) -- (stats.north east) node[midway, below, font=\tiny] {update};
+        \draw[arrow] (stats.north) |- (osm.west) node[pos=0.75, above, font=\tiny] {rescale};
+
+        % --- Write back to HBM ---
+        \draw[dasharrow] (acc.south) -- ++(0, -0.7) -| (Oi_hbm.east) node[pos=0.25, below, font=\tiny, color=gray] {write once (final)};
+
+        % --- Loop annotation ---
+        \draw[thick, blue!60!black, -{Stealth}] (6.8, 2.0) arc[start angle=60, end angle=-60, radius=1.8cm]
+            node[midway, right, font=\tiny, color=blue!60!black, align=left] {repeat for\\each $K_j, V_j$\\block};
+
+    \end{tikzpicture}
+    \end{center}
+
+    \vspace{-0.1cm}
+    \footnotesize
+    \textbf{Single kernel.} $Q_i$ loaded once; $K_j, V_j$ stream through SRAM. The $N{\times}N$ matrix is \textbf{never materialized} in HBM. HBM traffic: $O(N)$ per query block.
+\end{frame}
+
+% ===== SLIDE 6: Flash Attention Results =====
 \begin{frame}{Flash Attention: Results}
     \begin{table}[]
     \centering
@@ -129,98 +284,203 @@
     \begin{tabular}{|l|c|c|c|c|}
     \hline
     \textbf{Config ($N$)} & \textbf{Vanilla Time} & \textbf{Flash Time} & \textbf{Vanilla Mem} & \textbf{Flash Mem} \\ \hline
-    B=1 H=1 N=64         & 98.3 $\mu$s           & 66.7 $\mu$s         & 8.0 MB               & 8.0 MB             \\ 
-    B=1 H=4 N=256        & 93.9 $\mu$s           & 418.4 $\mu$s        & 11.0 MB              & 9.0 MB             \\ 
+    B=1 H=1 N=64         & 98.3 $\mu$s           & 66.7 $\mu$s         & 8.0 MB               & 8.0 MB             \\
+    B=1 H=4 N=256        & 93.9 $\mu$s           & 418.4 $\mu$s        & 11.0 MB              & 9.0 MB             \\
     B=4 H=8 N=1024       & 1.52 ms               & 17.34 ms            & 298.0 MB             & 42.0 MB            \\ \hline
     \end{tabular}%
     }
     \caption{Time and Memory footprints (Vanilla vs Flash Attention)}
     \end{table}
-    \textit{Note:} Our pedagogical implementation dramatically cuts peak memory consumption to an $O(N)$ profile, even if raw matrix multiplication isn't yet fully optimized for speed.
+    \begin{itemize}
+        \item \textbf{Memory:} At $N{=}1024$, flash uses $\mathbf{7{\times}}$ less memory (42\,MB vs 298\,MB), confirming the $O(N)$ profile.
+        \item \textbf{Latency:} Our pedagogical kernel is slower due to un-optimized shared-memory tiling, but the \emph{memory savings are the primary goal} of this implementation.
+    \end{itemize}
 \end{frame}
 
-\begin{frame}{Paged Attention: Tackling Memory Fragmentation}
+% ===== SLIDE 7: Paged Attention -- Motivation =====
+\begin{frame}{Paged Attention: Tackling KV Cache Fragmentation}
     \begin{center}
     \begin{tikzpicture}[
-        node distance=0.5cm,
-        cell/.style={draw, rectangle, minimum width=1.1cm, minimum height=0.6cm, font=\scriptsize},
-        used/.style={fill=blue!30},
-        unused/.style={fill=gray!20},
-        reserved/.style={fill=red!30},
-        arrow/.style={-{Stealth}, thick}
+        cell/.style={draw, rectangle, minimum width=1.0cm, minimum height=0.6cm, font=\scriptsize},
+        used/.style={fill=blue!25},
+        unused/.style={fill=gray!15, text=gray!60},
+        reserved/.style={fill=red!20},
+        arrow/.style={-{Stealth[length=5pt]}, thick}
     ]
-        % Naive approach
-        \node[font=\footnotesize\bfseries] at (0, 3) {Naive Contiguous KV Cache};
-        \node[cell, used] (n1) at (-2.5, 2.3) {Req 1};
-        \node[cell, used] (n2) at (-1.4, 2.3) {Req 1};
-        \node[cell, unused] (n3) at (-0.3, 2.3) {Frag.};
-        \node[cell, reserved] (n4) at (0.8, 2.3) {Rsvd};
-        \node[cell, reserved] (n5) at (1.9, 2.3) {Rsvd};
-        \node[cell, used] (n6) at (3.0, 2.3) {Req 2};
-        \node[cell, used] (n7) at (4.1, 2.3) {Req 2};
-        
-        \node[font=\scriptsize, align=center, color=red!70!black] at (0.8, 1.6) {Internal (Rsvd) \& External (Frag) Fragmentation};
-        
-        \draw[thick, loosely dotted] (-3.5, 1.2) -- (5, 1.2);
-        
-        % Paged Approach
-        \node[font=\footnotesize\bfseries] at (0, 0.7) {Paged Attention KV Cache};
-        
-        % Logical Page Table
-        \node[draw, rectangle, minimum width=2.5cm, minimum height=1.5cm, align=left, font=\scriptsize, fill=yellow!10] (pt) at (-1.5, -0.6) {\textbf{Page Table}\\L-pg 0 $\rightarrow$ P-pg 2\\L-pg 1 $\rightarrow$ P-pg 0};
-        
-        % Physical blocks
-        \node[cell, used] (p0) at (2.5, 0) {P-pg 0};
-        \node[cell, unused] (p1) at (2.5, -0.7) {P-pg 1};
-        \node[cell, used] (p2) at (2.5, -1.4) {P-pg 2};
-        \node[cell, unused] (p3) at (2.5, -2.1) {P-pg 3};
-        
-        \draw[arrow] (-0.2, -0.4) -- (p2.west);
-        \draw[arrow] (-0.2, -0.8) -- (p0.west);
-        
+        % === Naive contiguous layout ===
+        \node[font=\scriptsize\bfseries] at (0, 3.2) {Contiguous KV Cache (Naive)};
+
+        \node[cell, used]     at (-3.0, 2.4) {Req\,1};
+        \node[cell, used]     at (-2.0, 2.4) {Req\,1};
+        \node[cell, used]     at (-1.0, 2.4) {Req\,1};
+        \node[cell, reserved] at ( 0.0, 2.4) {\color{red!70}Rsvd};
+        \node[cell, reserved] at ( 1.0, 2.4) {\color{red!70}Rsvd};
+        \node[cell, unused]   at ( 2.0, 2.4) {Free};
+        \node[cell, used, fill=cyan!25] at ( 3.0, 2.4) {Req\,2};
+        \node[cell, used, fill=cyan!25] at ( 4.0, 2.4) {Req\,2};
+
+        % Annotations
+        \draw[decorate, decoration={brace, amplitude=4pt, mirror}, red!60!black]
+            (-0.5, 2.0) -- (1.5, 2.0) node[midway, below=5pt, font=\tiny, color=red!70!black, align=center] {Internal frag.\\(reserved, unused)};
+        \draw[{Stealth}-{Stealth}, red!60!black, thick] (1.6, 2.4) -- (2.4, 2.4)
+            node[midway, above, font=\tiny, color=red!70!black] {External frag.};
+
+        \node[font=\tiny, color=red!60!black, align=center] at (0.5, 0.95) {Must pre-allocate for max possible length.\\Cannot reclaim or share unused slots.};
+
+        % === Paged layout ===
+        \node[font=\scriptsize\bfseries] at (0, 0.4) {Paged KV Cache};
+
+        % Page Table for Req 1
+        \node[draw, fill=yellow!12, rounded corners, minimum width=2.5cm, minimum height=1.4cm, align=left, font=\tiny, inner sep=4pt] (pt1) at (-2.5, -0.8)
+            {\textbf{Req\,1 Page Table}\\[1pt]
+             Logical\,0 $\to$ Phys\,3\\
+             Logical\,1 $\to$ Phys\,0\\
+             Logical\,2 $\to$ Phys\,5};
+
+        % Page Table for Req 2
+        \node[draw, fill=cyan!12, rounded corners, minimum width=2.5cm, minimum height=1.0cm, align=left, font=\tiny, inner sep=4pt] (pt2) at (-2.5, -2.3)
+            {\textbf{Req\,2 Page Table}\\[1pt]
+             Logical\,0 $\to$ Phys\,1\\
+             Logical\,1 $\to$ Phys\,4};
+
+        % Physical block pool
+        \node[font=\tiny\bfseries] at (2.5, -0.05) {Physical Block Pool};
+        \node[cell, used, minimum width=0.8cm] (p0) at (1.5, -0.6) {Pg\,0};
+        \node[cell, used, fill=cyan!25, minimum width=0.8cm] (p1) at (2.5, -0.6) {Pg\,1};
+        \node[cell, unused, minimum width=0.8cm] (p2) at (3.5, -0.6) {Pg\,2};
+        \node[cell, used, minimum width=0.8cm] (p3) at (1.5, -1.3) {Pg\,3};
+        \node[cell, used, fill=cyan!25, minimum width=0.8cm] (p4) at (2.5, -1.3) {Pg\,4};
+        \node[cell, used, minimum width=0.8cm] (p5) at (3.5, -1.3) {Pg\,5};
+        \node[cell, unused, minimum width=0.8cm] (p6) at (1.5, -2.0) {Pg\,6};
+        \node[cell, unused, minimum width=0.8cm] (p7) at (2.5, -2.0) {Pg\,7};
+
+        % Arrows from page tables to physical blocks
+        \draw[arrow, blue!60!black, thin] ([yshift=0.15cm]pt1.east) -- (p3.west);
+        \draw[arrow, blue!60!black, thin] ([yshift=-0.05cm]pt1.east) -- (p0.west);
+        \draw[arrow, blue!60!black, thin] ([yshift=-0.25cm]pt1.east) -- (p5.west);
+        \draw[arrow, cyan!60!black, thin] ([yshift=0.1cm]pt2.east) -- (p1.south west);
+        \draw[arrow, cyan!60!black, thin] ([yshift=-0.1cm]pt2.east) -- (p4.west);
+
     \end{tikzpicture}
     \end{center}
-    
+
+    \vspace{-0.1cm}
+    \footnotesize
+    \textbf{Key idea:} Borrow OS virtual memory paging. Each request's KV cache maps through a per-request \textbf{page table} to \emph{non-contiguous} physical blocks. Blocks are allocated on-demand and freed immediately, eliminating fragmentation.
+\end{frame}
+
+% ===== SLIDE 8: Paged Attention -- Kernel Design =====
+\begin{frame}{Paged Attention: Kernel Design (V1 vs V2)}
+    \begin{center}
+    \begin{tikzpicture}[
+        box/.style={draw, rounded corners, minimum width=3.4cm, minimum height=2.5cm, align=center, font=\scriptsize},
+        stepbox/.style={font=\tiny, align=left},
+        arrow/.style={-{Stealth[length=5pt]}, thick}
+    ]
+        % V1
+        \node[box, fill=red!5] (v1) at (-2.8, 0) {};
+        \node[font=\scriptsize\bfseries, color=red!60!black] at (-2.8, 1.55) {V1: Naive};
+        \node[stepbox] at (-2.8, 0.1) {
+            1 thread $\to$ 1 output scalar\\[2pt]
+            For \emph{each} output dim $x$:\\
+            \quad loop all $N$ tokens:\\
+            \quad\quad page lookup\\
+            \quad\quad recompute dot product\\
+            \quad\quad accumulate\\[2pt]
+            \textcolor{red!70!black}{Redundant: scores computed}\\
+            \textcolor{red!70!black}{$d$ times (once per dim)}
+        };
+
+        % Arrow
+        \draw[arrow, very thick, green!50!black] (-0.8, 0) -- (0.8, 0)
+            node[midway, above, font=\tiny, color=green!50!black] {$12.8\times$ speedup};
+
+        % V2
+        \node[box, fill=green!5] (v2) at (2.8, 0) {};
+        \node[font=\scriptsize\bfseries, color=green!50!black] at (2.8, 1.55) {V2: Optimized};
+        \node[stepbox] at (2.8, 0.1) {
+            1 block $\to$ 1 $(b, h)$ pair\\[2pt]
+            Step 1: load $q$ into shared mem\\
+            Step 2: compute all $N$ scores\\
+            \quad\quad (parallel reduction for max)\\
+            Step 3: softmax (exp, sum reduce)\\
+            Step 4: threads split output dims:\\
+            \quad\quad reuse stored scores\\[2pt]
+            \textcolor{green!50!black}{Scores computed once,}\\
+            \textcolor{green!50!black}{reused across all $d$ dims}
+        };
+
+    \end{tikzpicture}
+    \end{center}
+
     \vspace{0.1cm}
     \footnotesize
-    \textbf{Solution:} OS paging concepts for the KV Cache. Memory is dynamically allocated in non-contiguous \textbf{blocks} instead of continuous chunks. Thread blocks resolve logical KV addresses seamlessly via the \textbf{Page Table}.
+    \textbf{V2 wins by:} (1) computing attention scores \emph{once} and reusing them, (2) cooperative thread-block reductions for max/sum, and (3) coalesced global memory reads via block-level parallelism.
 \end{frame}
 
+% ===== SLIDE 9: Paged Attention Results =====
 \begin{frame}{Paged Attention: Results}
-    \begin{table}[]
-    \centering
-    \resizebox{\columnwidth}{!}{%
-    \begin{tabular}{|l|c|c|c|c|}
-    \hline
-    \textbf{Implementation} & \textbf{Latency/fwd} & \textbf{Fwd/s} & \textbf{Rows/s} \\ \hline
-    Paged v1               & 2.58 ms             & 388.0          & 1,552.2       \\ 
-    Paged v2               & 200.1 $\mu$s        & 4,996.4        & 19,985.7      \\ \hline
-    \end{tabular}%
-    }
-    \caption{Paged Attention Throughput (Config: B=4, H=8, d=64, N=512)}
-    \end{table}
-    \textbf{Optimization Note:} Version 2 achieves a 12.8x speedup by optimizing thread block workload distribution and enabling coalesced reads from global memory.
-\end{frame}
-
-\begin{frame}{End-to-End Integration in GPT-2}
-    \begin{itemize}
-        \item We integrated our custom \textbf{Flash Attention} and \textbf{Paged Attention} CUDA kernels directly into the HuggingFace GPT-2 model.
-        \item \textbf{Prefill Phase:} Uses the Flash Attention kernel to process the initial prompt.
-        \item \textbf{Decode Phase:} Uses the Paged Attention kernel to process generated tokens sequentially.
-    \end{itemize}
-    \vspace{0.5cm}
     \begin{table}[]
     \centering
     \resizebox{\columnwidth}{!}{%
     \begin{tabular}{|l|c|c|c|}
     \hline
+    \textbf{Implementation} & \textbf{Latency/fwd} & \textbf{Fwd/s} & \textbf{Rows/s} \\ \hline
+    Paged v1               & 2.58 ms             & 388.0          & 1,552.2       \\
+    Paged v2               & 200.1 $\mu$s        & 4,996.4        & 19,985.7      \\ \hline
+    \end{tabular}%
+    }
+    \caption{Paged Attention Throughput (Config: B=4, H=8, d=64, N=512)}
+    \end{table}
+    \textbf{V2 achieves a $\mathbf{12.8\times}$ speedup} by eliminating redundant score computation and leveraging cooperative thread-block reductions with coalesced memory access.
+\end{frame}
+
+% ===== SLIDE 10: GPT-2 End-to-End Integration =====
+\begin{frame}{End-to-End Integration: GPT-2}
+    \begin{center}
+    \begin{tikzpicture}[
+        phase/.style={draw, rounded corners, minimum width=3.8cm, minimum height=1.6cm, align=center, font=\scriptsize},
+        arrow/.style={-{Stealth[length=5pt]}, thick}
+    ]
+        % Prefill
+        \node[phase, fill=green!10] (prefill) at (-3.2, 0) {
+            \textbf{Prefill Phase}\\[3pt]
+            Process full prompt ($N$ tokens)\\
+            Uses \textbf{Flash Attention}\\
+            (tiled, fused kernel)
+        };
+
+        % Decode
+        \node[phase, fill=blue!10] (decode) at (3.2, 0) {
+            \textbf{Decode Phase}\\[3pt]
+            Generate tokens one-by-one\\
+            Uses \textbf{Paged Attention}\\
+            (single-query vs KV cache)
+        };
+
+        \draw[arrow] (prefill) -- (decode) node[midway, above, font=\tiny] {KV cache filled};
+
+        % Labels
+        \node[font=\tiny, color=green!50!black] at (-3.2, -1.3) {$Q,K,V$ all length $N$ $\to$ Flash};
+        \node[font=\tiny, color=blue!50!black] at (3.2, -1.3) {$Q$: 1 token, $K,V$: growing cache $\to$ Paged};
+
+    \end{tikzpicture}
+    \end{center}
+
+    \vspace{0.3cm}
+    \begin{table}[]
+    \centering
+    \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{|l|c|c|}
+    \hline
     \textbf{Variant} & \textbf{Prefill (N=512) Latency} & \textbf{End-to-End TPS} \\ \hline
-    Standard HF      & 10.99 ms                        & 114.20 tokens/sec       \\ 
-    Custom Kernels   & 11.04 ms                        & 112.29 tokens/sec       \\ \hline
+    Standard HuggingFace  & 10.99 ms                        & 114.20 tokens/sec       \\
+    Custom CUDA Kernels   & 11.04 ms                        & 112.29 tokens/sec       \\ \hline
     \end{tabular}%
     }
     \end{table}
-    \textit{Note:} Our implementation achieves performance parity with pure PyTorch HuggingFace layers, proving the correctness of the custom kernels.
+    \footnotesize
+    \textbf{Performance parity} with PyTorch/HuggingFace confirms correctness of both custom kernels when integrated into a real model's inference pipeline.
 \end{frame}
 
 \end{document}
