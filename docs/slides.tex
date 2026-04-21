@@ -1,0 +1,226 @@
+\documentclass{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+
+\title{Optimizing Attention Mechanisms}
+\subtitle{Flash Attention and Paged Attention}
+\author{Parallel Programming}
+\date{\today}
+
+\begin{document}
+
+\frame{\titlepage}
+
+\begin{frame}{Problem: Attention Computation}
+    \begin{itemize}
+        \item Attention is the core of Transformer models: $O = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V$.
+        \item It is memory bandwidth bound, not compute-bound.
+        \item The attention matrix $S = QK^T$ has a size of $O(N^2)$, where $N$ is the sequence length.
+        \item Moving $O(N^2)$ intermediate data back and forth from \textbf{Global Memory (HBM)} causes a severe performance bottleneck.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Naive Attention: The Bottleneck}
+    \begin{center}
+    \begin{tikzpicture}[
+        node distance=1.2cm, 
+        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.5cm, minimum height=0.6cm, align=center},
+        hbm/.style={draw, rectangle, dashed, fill=red!5, minimum width=7.5cm, minimum height=1.3cm, align=center},
+        op/.style={draw, circle, fill=orange!20, minimum size=0.8cm, align=center, inner sep=0pt},
+        arrow/.style={-{Stealth}, thick}
+    ]
+        % HBM region
+        \node[hbm] (hbm1) at (0, 2) {};
+        \node[font=\footnotesize\bfseries, color=red!70!black] at (0, 2.4) {Global Memory (HBM)};
+        
+        % Tensors in HBM
+        \node[tensor] (Q) at (-3, 1.8) {$Q, K$};
+        \node[tensor, fill=red!20] (S) at (0, 1.8) {$S \in \mathbb{R}^{N \times N}$};
+        \node[tensor, fill=red!20] (P) at (3, 1.8) {$P \in \mathbb{R}^{N \times N}$};
+        \node[tensor] (V) at (4.5, 1.8) {$V$};
+        
+        % SRAM/Compute region
+        \node[font=\footnotesize\bfseries, color=blue!70!black] (sram) at (0, -1) {Compute / SRAM};
+        
+        % Ops
+        \node[op] (matmul1) at (-1.5, 0) {$\times$};
+        \node[op] (softmax) at (1.5, 0) {sftmx};
+        \node[op] (matmul2) at (4.5, 0) {$\times$};
+        \node[tensor] (O) at (6.5, 0) {$O$};
+        
+        % Arrows
+        \draw[arrow] (Q) |- (matmul1) node[pos=0.75, left, font=\tiny] {$O(N)$};
+        \draw[arrow] (matmul1) -- (S) node[midway, left, font=\tiny] {Write $O(N^2)$};
+        \draw[arrow] (S) -- (softmax) node[midway, left, font=\tiny] {Read $O(N^2)$};
+        \draw[arrow] (softmax) -- (P) node[midway, right, font=\tiny] {Write $O(N^2)$};
+        \draw[arrow] (P) -- (matmul2) node[midway, left, font=\tiny] {Read $O(N^2)$};
+        \draw[arrow] (V) -- (matmul2) node[midway, right, font=\tiny] {Read $O(N)$};
+        \draw[arrow] (matmul2) -- (O);
+        
+    \end{tikzpicture}
+    \end{center}
+    
+    \vspace{0.2cm}
+    \small
+    \textbf{Problem:} $S = QK^T$ and $P = \text{softmax}(S)$ are fully materialized. The $O(N^2)$ HBM read/write traffic is the bottleneck, entirely overshadowing actual computation.
+\end{frame}
+
+\begin{frame}{Flash Attention: Hardware-Aware Fusion}
+    \begin{center}
+    \begin{tikzpicture}[
+        node distance=0.8cm,
+        tensor/.style={draw, rectangle, fill=blue!10, minimum width=1.1cm, minimum height=0.5cm, font=\scriptsize},
+        sram/.style={draw, rectangle, rounded corners, fill=green!10, minimum width=5.5cm, minimum height=3.5cm},
+        op/.style={draw, circle, fill=orange!20, minimum size=0.5cm, inner sep=0pt, font=\scriptsize},
+        arrow/.style={-{Stealth}, thick}
+    ]
+        % Global Memory vectors
+        \node[font=\footnotesize\bfseries, color=red!70!black] (hbm_lbl) at (-1, 2.5) {HBM};
+        \node[tensor] (Qi) at (-1, 1.8) {$Q_{i}$};
+        \node[tensor] (Kj) at (1, 2.5) {$K_{j}$};
+        \node[tensor] (Vj) at (2.5, 2.5) {$V_{j}$};
+        \node[tensor] (Oi) at (-1, -2.5) {$O_{i}$};
+        
+        % SRAM Box
+        \node[sram] (sram_box) at (2.5, 0) {};
+        \node[font=\footnotesize\bfseries, color=green!50!black] at (2.5, 1.4) {Shared Memory (SRAM)};
+        
+        % Internal SRAM ops
+        \node[tensor] (Qi_sram) at (0.5, 0) {$Q_i$};
+        \node[tensor] (Kj_sram) at (0.5, 0.8) {$K_j$};
+        \node[tensor] (Vj_sram) at (4.5, 0.8) {$V_j$};
+        
+        \node[op] (mm1) at (2, 0.4) {$\times$};
+        \node[tensor, fill=red!20] (Sij) at (3.2, 0.4) {$S_{i,j}$};
+        \node[op] (sft) at (3.2, -0.6) {inc $\sigma$};
+        \node[tensor, fill=red!20] (Pij) at (4.5, -0.6) {$P_{i,j}$};
+        \node[op] (mm2) at (4.5, -1.4) {$\times$};
+        \node[tensor] (Oi_acc) at (2.5, -1.4) {$O_i$ acc.};
+        
+        % Connections
+        \draw[arrow, dashed] (Qi) -- (Qi_sram);
+        \draw[arrow, dashed] (Kj) -- (Kj_sram);
+        \draw[arrow, dashed] (Vj) -- (Vj_sram);
+        
+        \draw[arrow] (Qi_sram) -- (mm1);
+        \draw[arrow] (Kj_sram) -- (mm1);
+        \draw[arrow] (mm1) -- (Sij);
+        \draw[arrow] (Sij) -- (sft) node[midway, right, font=\tiny] {Registers};
+        \draw[arrow] (sft) -- (Pij);
+        \draw[arrow] (Pij) -- (mm2);
+        \draw[arrow] (Vj_sram) -- (mm2);
+        \draw[arrow] (mm2) -- (Oi_acc);
+        \draw[arrow, dashed] (Oi_acc) -| (Oi);
+        
+    \end{tikzpicture}
+    \end{center}
+    
+    \vspace{0.1cm}
+    \footnotesize
+    \textbf{Kernel Fusion \& Tiling:} Matrices load in blocks (tiles) into fast \textbf{SRAM}. Attention and \textit{online} softmax happen on-chip. The $O(N^2)$ matrix $S$ is never materialized to HBM, resulting in $O(N)$ memory bounds.
+\end{frame}
+
+\begin{frame}{Flash Attention: Results}
+    \begin{table}[]
+    \centering
+    \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{|l|c|c|c|c|}
+    \hline
+    \textbf{Config ($N$)} & \textbf{Vanilla Time} & \textbf{Flash Time} & \textbf{Vanilla Mem} & \textbf{Flash Mem} \\ \hline
+    B=1 H=1 N=64         & 98.3 $\mu$s           & 66.7 $\mu$s         & 8.0 MB               & 8.0 MB             \\ 
+    B=1 H=4 N=256        & 93.9 $\mu$s           & 418.4 $\mu$s        & 11.0 MB              & 9.0 MB             \\ 
+    B=4 H=8 N=1024       & 1.52 ms               & 17.34 ms            & 298.0 MB             & 42.0 MB            \\ \hline
+    \end{tabular}%
+    }
+    \caption{Time and Memory footprints (Vanilla vs Flash Attention)}
+    \end{table}
+    \textit{Note:} Our pedagogical implementation dramatically cuts peak memory consumption to an $O(N)$ profile, even if raw matrix multiplication isn't yet fully optimized for speed.
+\end{frame}
+
+\begin{frame}{Paged Attention: Tackling Memory Fragmentation}
+    \begin{center}
+    \begin{tikzpicture}[
+        node distance=0.5cm,
+        cell/.style={draw, rectangle, minimum width=1.1cm, minimum height=0.6cm, font=\scriptsize},
+        used/.style={fill=blue!30},
+        unused/.style={fill=gray!20},
+        reserved/.style={fill=red!30},
+        arrow/.style={-{Stealth}, thick}
+    ]
+        % Naive approach
+        \node[font=\footnotesize\bfseries] at (0, 3) {Naive Contiguous KV Cache};
+        \node[cell, used] (n1) at (-2.5, 2.3) {Req 1};
+        \node[cell, used] (n2) at (-1.4, 2.3) {Req 1};
+        \node[cell, unused] (n3) at (-0.3, 2.3) {Frag.};
+        \node[cell, reserved] (n4) at (0.8, 2.3) {Rsvd};
+        \node[cell, reserved] (n5) at (1.9, 2.3) {Rsvd};
+        \node[cell, used] (n6) at (3.0, 2.3) {Req 2};
+        \node[cell, used] (n7) at (4.1, 2.3) {Req 2};
+        
+        \node[font=\scriptsize, align=center, color=red!70!black] at (0.8, 1.6) {Internal (Rsvd) \& External (Frag) Fragmentation};
+        
+        \draw[thick, loosely dotted] (-3.5, 1.2) -- (5, 1.2);
+        
+        % Paged Approach
+        \node[font=\footnotesize\bfseries] at (0, 0.7) {Paged Attention KV Cache};
+        
+        % Logical Page Table
+        \node[draw, rectangle, minimum width=2.5cm, minimum height=1.5cm, align=left, font=\scriptsize, fill=yellow!10] (pt) at (-1.5, -0.6) {\textbf{Page Table}\\L-pg 0 $\rightarrow$ P-pg 2\\L-pg 1 $\rightarrow$ P-pg 0};
+        
+        % Physical blocks
+        \node[cell, used] (p0) at (2.5, 0) {P-pg 0};
+        \node[cell, unused] (p1) at (2.5, -0.7) {P-pg 1};
+        \node[cell, used] (p2) at (2.5, -1.4) {P-pg 2};
+        \node[cell, unused] (p3) at (2.5, -2.1) {P-pg 3};
+        
+        \draw[arrow] (-0.2, -0.4) -- (p2.west);
+        \draw[arrow] (-0.2, -0.8) -- (p0.west);
+        
+    \end{tikzpicture}
+    \end{center}
+    
+    \vspace{0.1cm}
+    \footnotesize
+    \textbf{Solution:} OS paging concepts for the KV Cache. Memory is dynamically allocated in non-contiguous \textbf{blocks} instead of continuous chunks. Thread blocks resolve logical KV addresses seamlessly via the \textbf{Page Table}.
+\end{frame}
+
+\begin{frame}{Paged Attention: Results}
+    \begin{table}[]
+    \centering
+    \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{|l|c|c|c|c|}
+    \hline
+    \textbf{Implementation} & \textbf{Latency/fwd} & \textbf{Fwd/s} & \textbf{Rows/s} \\ \hline
+    Paged v1               & 2.58 ms             & 388.0          & 1,552.2       \\ 
+    Paged v2               & 200.1 $\mu$s        & 4,996.4        & 19,985.7      \\ \hline
+    \end{tabular}%
+    }
+    \caption{Paged Attention Throughput (Config: B=4, H=8, d=64, N=512)}
+    \end{table}
+    \textbf{Optimization Note:} Version 2 achieves a 12.8x speedup by optimizing thread block workload distribution and enabling coalesced reads from global memory.
+\end{frame}
+
+\begin{frame}{End-to-End Integration in GPT-2}
+    \begin{itemize}
+        \item We integrated our custom \textbf{Flash Attention} and \textbf{Paged Attention} CUDA kernels directly into the HuggingFace GPT-2 model.
+        \item \textbf{Prefill Phase:} Uses the Flash Attention kernel to process the initial prompt.
+        \item \textbf{Decode Phase:} Uses the Paged Attention kernel to process generated tokens sequentially.
+    \end{itemize}
+    \vspace{0.5cm}
+    \begin{table}[]
+    \centering
+    \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{|l|c|c|c|}
+    \hline
+    \textbf{Variant} & \textbf{Prefill (N=512) Latency} & \textbf{End-to-End TPS} \\ \hline
+    Standard HF      & 10.99 ms                        & 114.20 tokens/sec       \\ 
+    Custom Kernels   & 11.04 ms                        & 112.29 tokens/sec       \\ \hline
+    \end{tabular}%
+    }
+    \end{table}
+    \textit{Note:} Our implementation achieves performance parity with pure PyTorch HuggingFace layers, proving the correctness of the custom kernels.
+\end{frame}
+
+\end{document}

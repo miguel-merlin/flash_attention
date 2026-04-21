@@ -1,0 +1,83 @@
+--- TIME ---
+[INFO] FlashAttentionCUDA loaded.
+[INFO] NativeVanillaCUDA loaded.
+[INFO] paged_attention v1 (CPU/CUDA op) available.
+[INFO] paged_attention v2 (CPU/CUDA op) available.
+
+============================================================
+Timing Benchmark  |  device=cuda  |  warmup=5  |  iters=20
+============================================================
+
+Finished B=1 H=1 N=64 d=32
+Finished B=1 H=1 N=128 d=64
+Finished B=1 H=4 N=256 d=64
+Finished B=2 H=8 N=512 d=64
+Finished B=4 H=8 N=1024 d=64
+Finished B=2 H=16 N=2048 d=128
+
+Config                 Vanilla   FlashCPP  FlashCUDA  NativeCUDA  Paged v1  Paged v2
+---------------------  --------  --------  ---------  ----------  --------  --------
+B=1 H=1 N=64 d=32      98.3 µs   N/A       66.7 µs    39.6 µs     146.1 µs  28.5 µs 
+B=1 H=1 N=128 d=64     95.8 µs   N/A       213.3 µs   83.0 µs     503.3 µs  53.7 µs 
+B=1 H=4 N=256 d=64     93.9 µs   N/A       418.4 µs   346.4 µs    1.27 ms   101.4 µs
+B=2 H=8 N=512 d=64     222.3 µs  N/A       2.93 ms    1.75 ms     2.55 ms   198.5 µs
+B=4 H=8 N=1024 d=64    1.52 ms   N/A       17.34 ms   13.18 ms    4.70 ms   361.8 µs
+B=2 H=16 N=2048 d=128  6.54 ms   N/A       81.57 ms   109.18 ms   28.11 ms  1.13 ms 
+
+--- MEMORY ---
+[INFO] FlashAttentionCUDA loaded.
+[INFO] paged_attention v1 (CPU/CUDA op) available.
+[INFO] paged_attention v2 (CPU/CUDA op) available.
+
+============================================================
+Memory Benchmark  |  device=cuda
+============================================================
+
+
+Config               Vanilla   FlashCPP  FlashCUDA  Paged v1  Paged v2
+-------------------  --------  --------  ---------  --------  --------
+B=1 H=1 N=64 d=32    8.0 MB    N/A       8.0 MB     8.0 MB    8.0 MB  
+B=1 H=1 N=128 d=64   8.0 MB    N/A       8.0 MB     8.0 MB    8.0 MB  
+B=1 H=4 N=256 d=64   11.0 MB   N/A       9.0 MB     9.0 MB    9.0 MB  
+B=2 H=8 N=512 d=64   48.0 MB   N/A       16.0 MB    16.0 MB   16.0 MB 
+B=4 H=8 N=1024 d=64  298.0 MB  N/A       42.0 MB    36.0 MB   36.0 MB 
+
+--- Theoretical memory for largest config ---
+  QKV tensors:         24.0 MB
+  Attention matrix:    128.0 MB
+  Total (vanilla):     152.0 MB
+  Flash (no attn mat): 24.0 MB (+ small SRAM tiles)
+  Paged decode (q+KV cache, no N×N mat): 4.0 MB
+
+--- PREFILL ---
+========================================================================
+Prefill-only GPT-2 benchmark (single forward pass over full prompt)
+========================================================================
+Device: cuda
+Loading GPT-2 tokenizer...
+Loading standard GPT-2 model...
+  standard  N=128   median=8.46 ms
+  standard  N=512   median=10.99 ms
+Loading patched GPT-2 model (FlashAttentionCUDA)...
+  patched   N=128   median=8.65 ms
+  patched   N=512   median=11.04 ms
+
+Results (median latency per prefill):
+     N        standard     flash_patched     speedup
+----------------------------------------------------
+   128         8.46 ms           8.65 ms       0.98x
+   512        10.99 ms          11.04 ms       1.00x
+
+Note: this benchmark measures only the prefill forward pass (full attention over N tokens), not generation.
+--- PAGED TPS ---
+Device: cuda
+Config: B=4  H=8  d=64  cached_tokens=512  page_size=16  is_causal=False
+
+impl       latency/fwd         fwd/s        rows/s
+--------------------------------------------------
+v1             2.58 ms         388.0       1,552.2
+v2            200.1 µs       4,996.4      19,985.7
+
+Speedup v2 vs v1: 12.88x  (lower latency is better)
+
+Note: This measures the custom paged_attention op only, not full LM generation (see benchmarks/bench_tps.py for GPT-2 TPS).
