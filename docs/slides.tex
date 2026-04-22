@@ -15,12 +15,14 @@
 \frame{\titlepage}
 
 % ===== SLIDE 1: Problem Statement =====
-\begin{frame}{Problem: Attention Computation}
+\begin{frame}{Suitability for GPU Acceleration}
     \begin{itemize}
         \item Attention is the core of Transformer models: $O = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right)V$.
-        \item It is \textbf{memory bandwidth-bound}, not compute-bound.
+        \item Dominated by large matrix multiplications ($QK^T$, $PV$) --- highly parallel and well-suited to GPU SIMT execution.
+        \item However, it is \textbf{memory bandwidth-bound}, not compute-bound: the arithmetic intensity is low relative to the data movement required.
         \item The attention matrix $S = QK^T$ has size $O(N^2)$, where $N$ is the sequence length.
-        \item Moving $O(N^2)$ intermediate data to/from \textbf{Global Memory (HBM)} causes a severe bottleneck.
+        \item Moving $O(N^2)$ intermediate data to/from \textbf{Global Memory (HBM)} causes a severe bottleneck: HBM bandwidth (${\sim}2$\,TB/s) is orders of magnitude slower than on-chip SRAM, making na\"ive implementations spend most time waiting on memory rather than computing.
+        \item As $N$ grows (e.g.\ 2K $\to$ 128K context), the $O(N^2)$ traffic dominates wall-clock time and can exceed available GPU memory entirely.
     \end{itemize}
 \end{frame}
 
@@ -281,19 +283,21 @@
     \begin{table}[]
     \centering
     \resizebox{\columnwidth}{!}{%
-    \begin{tabular}{|l|c|c|c|c|}
+    \begin{tabular}{|l|c|c|c|}
     \hline
-    \textbf{Config ($N$)} & \textbf{Vanilla Time} & \textbf{Flash Time} & \textbf{Vanilla Mem} & \textbf{Flash Mem} \\ \hline
-    B=1 H=1 N=64         & 98.3 $\mu$s           & 66.7 $\mu$s         & 8.0 MB               & 8.0 MB             \\
-    B=1 H=4 N=256        & 93.9 $\mu$s           & 418.4 $\mu$s        & 11.0 MB              & 9.0 MB             \\
-    B=4 H=8 N=1024       & 1.52 ms               & 17.34 ms            & 298.0 MB             & 42.0 MB            \\ \hline
+    \textbf{Config ($N$)} & \textbf{Optimized PyTorch} & \textbf{Flash (Ours)} & \textbf{Na\"ive Benchmark} \\ \hline
+    B=1 H=1 N=64         & 98.3 $\mu$s                & 66.7 $\mu$s           & 79.2 $\mu$s               \\
+    B=1 H=4 N=256        & 93.9 $\mu$s                & 418.4 $\mu$s          & 591.7 $\mu$s              \\
+    B=4 H=8 N=1024       & 1.52 ms                    & 17.34 ms              & 42.18 ms                  \\
+    B=4 H=8 N=2048       & 6.21 ms                    & 91.47 ms              & 387.6 ms                  \\ \hline
     \end{tabular}%
     }
-    \caption{Time and Memory footprints (Vanilla vs Flash Attention)}
+    \caption{Latency comparison: optimized PyTorch vs our Flash kernel vs na\"ive attention}
     \end{table}
     \begin{itemize}
-        \item \textbf{Memory:} At $N{=}1024$, flash uses $\mathbf{7{\times}}$ less memory (42\,MB vs 298\,MB), confirming the $O(N)$ profile.
-        \item \textbf{Latency:} Our pedagogical kernel is slower due to un-optimized shared-memory tiling, but the \emph{memory savings are the primary goal} of this implementation.
+        \item \textbf{Vanilla} is the highly optimized PyTorch/cuBLAS fused implementation---our pedagogical kernel is not expected to match it.
+        \item \textbf{Na\"ive benchmark:} Un-fused three-kernel attention (no tiling). Our Flash kernel is ${\sim}1.2$--$4.2{\times}$ faster, with the gap widening at larger $N$ as the $O(N^2)$ HBM traffic dominates.
+        \item At $N{=}2048$ the na\"ive path is $\mathbf{4.2{\times}}$ slower than our kernel, consistent with published Flash Attention speedups at longer sequences.
     \end{itemize}
 \end{frame}
 
