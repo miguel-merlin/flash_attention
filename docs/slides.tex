@@ -377,49 +377,73 @@
 \begin{frame}{Paged Attention: Kernel Design (V1 vs V2)}
     \begin{center}
     \begin{tikzpicture}[
-        box/.style={draw, rounded corners, minimum width=3.4cm, minimum height=2.5cm, align=center, font=\scriptsize},
-        stepbox/.style={font=\tiny, align=left},
+        box/.style={
+            draw,
+            rounded corners,
+            minimum width=4.65cm,
+            minimum height=3.35cm,
+            align=center,
+            font=\scriptsize
+        },
+        stepbox/.style={font=\fontsize{6.7}{7.7}\selectfont, align=left},
         arrow/.style={-{Stealth[length=5pt]}, thick}
     ]
         % V1
-        \node[box, fill=red!5] (v1) at (-2.8, 0) {};
-        \node[font=\scriptsize\bfseries, color=red!60!black] at (-2.8, 1.55) {V1: Naive};
-        \node[stepbox] at (-2.8, 0.1) {
-            1 thread $\to$ 1 output scalar\\[2pt]
-            For \emph{each} output dim $x$:\\
-            \quad loop all $N$ tokens:\\
-            \quad\quad page lookup\\
-            \quad\quad recompute dot product\\
-            \quad\quad accumulate\\[2pt]
-            \textcolor{red!70!black}{Redundant: scores computed}\\
-            \textcolor{red!70!black}{$d$ times (once per dim)}
+        \node[box, fill=red!5] (v1) at (-3.45, 0) {};
+        \node[font=\scriptsize\bfseries, color=red!60!black] at (-3.45, 1.95)
+            {V1: Scalar-Oriented Naive Kernel};
+
+        \node[stepbox] at (-3.45, 0.05) {
+            \textbf{Mapping:} 1 thread $\to$ 1 scalar\\
+            \quad computes $out[b,h,x]$\\[3pt]
+
+            For each output dim $x$:\\
+            \quad scan all $N$ cached tokens\\
+            \quad page lookup: logical $\to$ physical\\
+            \quad compute $q \cdot k_t$\\
+            \quad find softmax max\\
+            \quad recompute $q \cdot k_t$\\
+            \quad compute sum-exp + weighted value\\[3pt]
+
+            \textcolor{red!70!black}{Problem: scores, max, sum-exp}\\
+            \textcolor{red!70!black}{are recomputed for every $x$}
         };
 
         % Arrow
-        \draw[arrow, very thick, green!50!black] (-0.8, 0) -- (0.8, 0)
-            node[midway, above, font=\tiny, color=green!50!black] {$12.8\times$ speedup};
+        \draw[arrow, very thick, green!50!black] (-0.85, 0) -- (0.85, 0);
+        \node[font=\fontsize{5}{6}\selectfont, color=green!50!black, align=center] at (0, 0.55)
+    {$12.8\times$ speedup\\by sharing attention work};
 
         % V2
-        \node[box, fill=green!5] (v2) at (2.8, 0) {};
-        \node[font=\scriptsize\bfseries, color=green!50!black] at (2.8, 1.55) {V2: Optimized};
-        \node[stepbox] at (2.8, 0.1) {
-            1 block $\to$ 1 $(b, h)$ pair\\[2pt]
-            Step 1: load $q$ into shared mem\\
-            Step 2: compute all $N$ scores\\
-            \quad\quad (parallel reduction for max)\\
-            Step 3: softmax (exp, sum reduce)\\
-            Step 4: threads split output dims:\\
-            \quad\quad reuse stored scores\\[2pt]
-            \textcolor{green!50!black}{Scores computed once,}\\
-            \textcolor{green!50!black}{reused across all $d$ dims}
+        \node[box, fill=green!5] (v2) at (3.45, 0) {};
+        \node[font=\scriptsize\bfseries, color=green!50!black] at (3.45, 1.95)
+            {V2: Vector-Oriented Cooperative Kernel};
+
+        \node[stepbox] at (3.45, 0.05) {
+            \textbf{Mapping:} 1 block $\to$ 1 vector\\
+            \quad computes $out[b,h,:]$\\[3pt]
+
+            Within each $(b,h)$ block:\\
+            \quad load $q[b,h,:]$ into shared mem\\
+            \quad compute scores $q \cdot k_t$ once\\
+            \quad reduce local max $\to$ max score\\
+            \quad compute $e^{score - max}$\\
+            \quad reduce local sums $\to$ sum-exp\\
+            \quad split output dims $x$ across threads\\[3pt]
+
+            \textcolor{green!50!black}{Scores/weights computed once}\\
+            \textcolor{green!50!black}{and reused across all $d$ dims}
         };
 
     \end{tikzpicture}
     \end{center}
 
-    \vspace{0.1cm}
+    \vspace{0.15cm}
     \footnotesize
-    \textbf{V2 wins by:} (1) computing attention scores \emph{once} and reusing them, (2) cooperative thread-block reductions for max/sum, and (3) coalesced global memory reads via block-level parallelism.
+    \textbf{Key optimization:}
+    V2 changes the decomposition from \emph{one scalar per thread} to
+    \emph{one output vector per block}. This lets the block reuse the query vector,
+    attention scores, softmax max, and softmax denominator across all $d$ output dimensions.
 \end{frame}
 
 % ===== SLIDE 9: Paged Attention Results =====
