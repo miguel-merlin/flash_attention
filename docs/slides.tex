@@ -3,6 +3,7 @@
 \usecolortheme{default}
 \usepackage{tikz}
 \usepackage{amsmath}
+\usepackage{graphicx}
 \usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, decorations.pathreplacing, fit, backgrounds}
 
 \title{Optimizing Attention Mechanisms}
@@ -445,25 +446,78 @@
     \emph{one output vector per block}. This lets the block reuse the query vector,
     attention scores, softmax max, and softmax denominator across all $d$ output dimensions.
 \end{frame}
-
-% ===== SLIDE 9: Paged Attention Results =====
-\begin{frame}{Paged Attention: Results}
+% ===== SLIDE 9: Paged Attention -- Runtime Scaling =====
+\begin{frame}{Paged Attention: Runtime Scaling}
     \begin{table}[]
     \centering
-    \resizebox{\columnwidth}{!}{%
-    \begin{tabular}{|l|c|c|c|}
+    \resizebox{0.78\columnwidth}{!}{%
+    \begin{tabular}{|c|c|c|c|}
     \hline
-    \textbf{Implementation} & \textbf{Latency/fwd} & \textbf{Fwd/s} & \textbf{Rows/s} \\ \hline
-    Paged v1               & 2.58 ms             & 388.0          & 1,552.2       \\
-    Paged v2               & 200.1 $\mu$s        & 4,996.4        & 19,985.7      \\ \hline
+    \textbf{Batch Size} & \textbf{Paged v1} & \textbf{Paged v2} & \textbf{Speedup} \\ \hline
+    B=1  & 9.45 ms  & 955.4 $\mu$s & 9.9$\times$  \\
+    B=2  & 9.50 ms  & 970.4 $\mu$s & 9.8$\times$  \\
+    B=4  & 9.73 ms  & 974.0 $\mu$s & 10.0$\times$ \\
+    B=8  & 9.96 ms  & 974.1 $\mu$s & 10.2$\times$ \\
+    B=16 & 10.06 ms & 1.09 ms       & 9.2$\times$  \\
+    B=32 & 10.05 ms & 1.21 ms       & 8.3$\times$  \\ \hline
     \end{tabular}%
     }
-    \caption{Paged Attention Throughput (Config: B=4, H=8, d=64, N=512)}
+    \caption{Paged Attention runtime on CUDA while scaling batch size at fixed $H=8$, $N=2048$, $d=64$.}
     \end{table}
-    \textbf{V2 achieves a $\mathbf{12.8\times}$ speedup} by eliminating redundant score computation and leveraging cooperative thread-block reductions with coalesced memory access.
+
+    \vspace{0.1cm}
+    \footnotesize
+    \textbf{Takeaway:} Paged v2 is consistently $\sim$8--10$\times$ faster than v1.
+    V1 computes one output scalar per thread and repeatedly recomputes scores/softmax statistics.
+    V2 computes one output vector per block, reusing scores, max, and denominator across all $d$ dimensions.
 \end{frame}
 
-% ===== SLIDE 10: GPT-2 End-to-End Integration =====
+% ===== SLIDE 10: Paged Attention -- Memory Scaling =====
+\begin{frame}{Paged Attention: Memory Scaling on A100}
+\vspace{-0.25cm}
+
+\begin{center}
+\footnotesize
+\textbf{Peak GPU memory while scaling batch size at fixed $H=8$, $N=2048$, $d=64$}
+\end{center}
+
+\vspace{-0.15cm}
+
+% ---------- TABLE ON TOP ----------
+\begin{center}
+\scriptsize
+\resizebox{0.82\textwidth}{!}{%
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Batch} & \textbf{Vanilla} & \textbf{FlashCUDA} & \textbf{Paged Attention} \\ \hline
+B=1   & 284 MB  & 28 MB  & 28 MB  \\
+B=8   & 2.0 GB  & 144 MB & 112 MB \\
+B=32  & 8.0 GB  & 528 MB & 400 MB \\
+B=64  & 17.0 GB & 1.0 GB & 784 MB \\
+B=128 & 34.0 GB & 2.0 GB & 1.0 GB \\ \hline
+\end{tabular}%
+}
+\end{center}
+
+\vspace{-0.15cm}
+
+% ---------- CHART BELOW ----------
+\begin{center}
+    \includegraphics[
+        width=0.95\textwidth,
+        height=0.49\textheight,
+        keepaspectratio
+    ]{attentioncomp(1).png}
+\end{center}
+
+\vspace{-0.2cm}
+
+\footnotesize
+\textbf{Takeaway:} Vanilla attention reaches $34$ GB at $B=128$, while Paged Attention stays near $1$ GB by avoiding full attention-matrix materialization and using a paged KV cache.
+
+\end{frame}
+
+% ===== SLIDE 11: GPT-2 End-to-End Integration =====
 \begin{frame}{End-to-End Integration: GPT-2}
     \begin{center}
     \begin{tikzpicture}[
